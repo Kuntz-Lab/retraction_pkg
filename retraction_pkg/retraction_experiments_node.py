@@ -160,18 +160,24 @@ class RetractionExperimentsNode(Node):
     # ===========================
     # EXPERIMENT LOOP
     # ===========================
-    def run_experiments(self):
+    def run_experiment(self):
         """Main blocking experiment loop. Runs on the main thread while callbacks spin in the background."""
-        experiment_idx = 0
+        iteration = 0
+
+        
+
+
         while rclpy.ok():
-            if input(f'Press Enter to run experiment {experiment_idx} (q to quit): ').strip().lower() == 'q':
+            if input(f'Press Enter to run iteration {iteration} (q to quit): ').strip().lower() == 'q':
                 break
 
-            self.run_experiment(experiment_idx)
-            experiment_idx += 1
 
-    def run_experiment(self, experiment_idx):
-        print(f'Running experiment {experiment_idx}')
+            
+            self.run_iteration(iteration)
+            iteration += 1
+
+    def run_iteration(self, iteration):
+        print(f'Running iteration {iteration}')
 
 
 # ===========================
@@ -189,7 +195,7 @@ def main(args=None):
     spin_thread.start()
 
     try:
-        node.run_experiments()
+        node.run_experiment()
     except (KeyboardInterrupt, EOFError, ExternalShutdownException):
         pass
     finally:
