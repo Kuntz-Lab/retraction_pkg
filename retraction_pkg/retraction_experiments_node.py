@@ -10,7 +10,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from retraction_interface.srv import GenerateGoalPointCloud
 from sensor_msgs.msg import PointCloud2
 
-# Latched, so RViz (with Durability: Transient Local) shows a snapshot published before it subscribed
+# Latched, so a late subscriber gets the last snapshot right away instead of waiting for the next timer tick
 SNAPSHOT_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 
@@ -20,7 +20,8 @@ class RetractionExperimentsNode(Node):
                  current_pc_topic='/tissue_pointcloud',
                  context_pc_topic='/context_pointcloud',
                  goal_service_name='/generate_goal_pointcloud',
-                 service_timeout_sec=60.0):
+                 service_timeout_sec=60.0,
+                 snapshot_publish_rate=0.5):
         super().__init__('retraction_experiments_node')
 
         self.service_timeout_sec = service_timeout_sec
@@ -50,6 +51,9 @@ class RetractionExperimentsNode(Node):
 
         self.goal_pc_client = self.create_client(GenerateGoalPointCloud, goal_service_name)
 
+        # Republish the snapshots so they can be visualized, and reach subscribers that joined late
+        self.snapshot_timer = self.create_timer(1.0 / snapshot_publish_rate, self.publish_snapshots)
+
         self.get_logger().info('Retraction experiments node initialized.')
 
     # ===========================
@@ -62,6 +66,18 @@ class RetractionExperimentsNode(Node):
     def context_pc_callback(self, msg):
         with self._lock:
             self._latest_context_pc = msg
+
+    # ===========================
+    # SNAPSHOT PUBLISHING
+    # ===========================
+    def publish_snapshots(self):
+        """Publish every snapshot taken so far."""
+        if self.current_pc_snapshot is not None:
+            self.current_pc_snapshot_pub.publish(self.current_pc_snapshot)
+        if self.context_pc_snapshot is not None:
+            self.context_pc_snapshot_pub.publish(self.context_pc_snapshot)
+        if self.goal_pc_snapshot is not None:
+            self.goal_pc_snapshot_pub.publish(self.goal_pc_snapshot)
 
     # ===========================
     # SNAPSHOTS
