@@ -4,6 +4,7 @@
 import threading
 
 import rclpy
+from geometry_msgs.msg import PoseStamped
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
@@ -17,6 +18,7 @@ SNAPSHOT_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 class RetractionExperimentsNode(Node):
 
     def __init__(self,
+                 dvrk_arm_name='PSM1',
                  current_pc_topic='/tissue_pointcloud',
                  context_pc_topic='/context_pointcloud',
                  goal_service_name='/generate_goal_pointcloud',
@@ -31,6 +33,9 @@ class RetractionExperimentsNode(Node):
         self._latest_current_pc = None
         self._latest_context_pc = None
 
+        # Latest measured Cartesian pose of the dVRK arm
+        self.current_dvrk_pose = None
+
         # Snapshots, taken from the experiment loop
         self.current_pc_snapshot = None
         self.context_pc_snapshot = None
@@ -41,6 +46,9 @@ class RetractionExperimentsNode(Node):
             PointCloud2, current_pc_topic, self.current_pc_callback, qos_profile_sensor_data)
         self.context_pc_sub = self.create_subscription(
             PointCloud2, context_pc_topic, self.context_pc_callback, qos_profile_sensor_data)
+        self.dvrk_pose_sub = self.create_subscription(
+            PoseStamped, f'/{dvrk_arm_name}/measured_cp', self.dvrk_pose_callback,
+            qos_profile_sensor_data)
 
         self.current_pc_snapshot_pub = self.create_publisher(
             PointCloud2, '/pushvibes_tissue_pointcloud', SNAPSHOT_QOS)
@@ -66,6 +74,9 @@ class RetractionExperimentsNode(Node):
     def context_pc_callback(self, msg):
         with self._lock:
             self._latest_context_pc = msg
+
+    def dvrk_pose_callback(self, msg):
+        self.current_dvrk_pose = msg
 
     # ===========================
     # SNAPSHOT PUBLISHING
@@ -163,8 +174,6 @@ class RetractionExperimentsNode(Node):
     def run_experiment(self):
         """Main blocking experiment loop. Runs on the main thread while callbacks spin in the background."""
         iteration = 0
-
-        
 
 
         while rclpy.ok():
