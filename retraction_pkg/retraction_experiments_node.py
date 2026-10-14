@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Run retraction experiments from snapshots of the live tissue and context point clouds."""
 
+import math
 import threading
+import time
 
+import crtk
+import dvrk
+import PyKDL
 import rclpy
-from geometry_msgs.msg import PoseStamped
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
@@ -28,13 +32,12 @@ class RetractionExperimentsNode(Node):
 
         self.service_timeout_sec = service_timeout_sec
 
+        self.dvrk_arm_name = dvrk_arm_name
+
         # Latest clouds, written by the subscriber callbacks on the executor thread
         self._lock = threading.Lock()
         self._latest_current_pc = None
         self._latest_context_pc = None
-
-        # Latest measured Cartesian pose of the dVRK arm
-        self.current_dvrk_pose = None
 
         # Snapshots, taken from the experiment loop
         self.current_pc_snapshot = None
@@ -46,9 +49,6 @@ class RetractionExperimentsNode(Node):
             PointCloud2, current_pc_topic, self.current_pc_callback, qos_profile_sensor_data)
         self.context_pc_sub = self.create_subscription(
             PointCloud2, context_pc_topic, self.context_pc_callback, qos_profile_sensor_data)
-        self.dvrk_pose_sub = self.create_subscription(
-            PoseStamped, f'/{dvrk_arm_name}/measured_cp', self.dvrk_pose_callback,
-            qos_profile_sensor_data)
 
         self.current_pc_snapshot_pub = self.create_publisher(
             PointCloud2, '/pushvibes_tissue_pointcloud', SNAPSHOT_QOS)
@@ -58,6 +58,10 @@ class RetractionExperimentsNode(Node):
             PointCloud2, '/pushvibes_context_pointcloud', SNAPSHOT_QOS)
 
         self.goal_pc_client = self.create_client(GenerateGoalPointCloud, goal_service_name)
+
+        # dVRK arm client, sharing this node instead of creating its own
+        self.ral = crtk.ral('retraction_experiments_node', node=self)
+        self.psm = dvrk.psm(self.ral, dvrk_arm_name)
 
         # Republish the snapshots so they can be visualized, and reach subscribers that joined late
         self.snapshot_timer = self.create_timer(1.0 / snapshot_publish_rate, self.publish_snapshots)
@@ -74,9 +78,6 @@ class RetractionExperimentsNode(Node):
     def context_pc_callback(self, msg):
         with self._lock:
             self._latest_context_pc = msg
-
-    def dvrk_pose_callback(self, msg):
-        self.current_dvrk_pose = msg
 
     # ===========================
     # SNAPSHOT PUBLISHING
@@ -169,11 +170,69 @@ class RetractionExperimentsNode(Node):
         return True
 
     # ===========================
+    # DVRK MOTION
+    # ===========================
+    def move_cp_linear(self, goal, step_size=0.002, speed=0.03):
+        """Move the dVRK in a straight line to goal (PyKDL.Frame) at speed (m/s).
+
+        The line is split into waypoints about step_size meters apart (orientation is
+        interpolated along with position), and each one is sent with move_cp on a fixed
+        schedule, without waiting for the previous one to finish. Each move_cp preempts the
+        last, so the arm follows the waypoints smoothly. Blocks until the goal is reached.
+
+        Allowable speeds (measured on the kinematic sim with the default 2 mm step size):
+        - Up to 5 cm/s: tracks the requested speed, stays within ~1 mm of the straight line.
+        - 5 to 8 cm/s: still tracks the speed, but strays up to ~1.5 mm from the line.
+        - Above ~8 cm/s: don't. move_cp's trajectory limits cap the arm at about 8 cm/s
+          on average, and it strays 5 to 10 mm from the line.
+        - Below ~1.2 cm/s: the average speed is right but the motion is stop-and-go, since
+          each waypoint is reached before the next is sent. Use a smaller step_size for
+          smooth slow motion (e.g. 1 mm is smooth down to ~0.8 cm/s).
+        """
+        if speed <= 0:
+            raise ValueError(f'speed must be positive, got {speed}')
+        start = self.psm.setpoint_cp(wait_timeout=2.0)[0]
+
+        # Rotation from start to goal, expressed in the start frame, as an axis and angle
+        angle, axis = (start.M.Inverse() * goal.M).GetRotAngle()
+
+        distance = (goal.p - start.p).Norm()
+        n_steps = max(1, math.ceil(distance / step_size))
+        dt = distance / n_steps / speed
+
+        # Schedule waypoints from a fixed start time so time spent sending doesn't slow the arm
+        t_start = time.monotonic()
+        for i in range(1, n_steps + 1):
+            s = i / n_steps
+            waypoint = PyKDL.Frame(start.M * PyKDL.Rotation.Rot(axis, s * angle),
+                                   start.p + s * (goal.p - start.p))
+            handle = self.psm.move_cp(waypoint)
+            if i < n_steps:
+                time.sleep(max(0.0, t_start + i * dt - time.monotonic()))
+        handle.wait()
+
+    # ===========================
     # EXPERIMENT LOOP
     # ===========================
     def run_experiment(self):
         """Main blocking experiment loop. Runs on the main thread while callbacks spin in the background."""
         iteration = 0
+
+        if input(f'Ensure the {self.dvrk_arm_name} gripper is closed and the wrist is oriented straight down. Press Enter to continue (q to quit): ').strip().lower() == 'q':
+            return
+        
+        dvrk_wrist_orientation = self.psm.measured_cp(wait_timeout=2.0)[0].M # type is PyKDL.Rotation
+
+        if input(f'Ensure the {self.dvrk_arm_name} end effector has 5cm of space around it for testing. Press Enter to continue (q to quit): ').strip().lower() == 'q':
+            return
+
+        self.get_logger().info(f'Moving {self.dvrk_arm_name} in small test path.')
+
+        # Move the arm 2 cm back and forth in x to verify the arm can move
+        for dx in [-0.02, 0.02]:
+            goal = PyKDL.Frame(dvrk_wrist_orientation, self.psm.measured_cp(wait_timeout=2.0)[0].p + PyKDL.Vector(dx, 0.0, 0.0))
+            self.move_cp_linear(goal, step_size=0.002, speed=0.03)
+
 
 
         while rclpy.ok():
@@ -204,6 +263,7 @@ def main(args=None):
     spin_thread.start()
 
     try:
+        node.ral.check_connections()
         node.run_experiment()
     except (KeyboardInterrupt, EOFError, ExternalShutdownException):
         pass

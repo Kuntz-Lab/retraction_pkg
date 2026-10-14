@@ -11,6 +11,8 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>retraction_interface</exec_depend>
+  <exec_depend>dvrk_python</exec_depend>
+  <exec_depend>crtk_python_client</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
