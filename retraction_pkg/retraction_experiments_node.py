@@ -4,6 +4,8 @@
 import math
 import threading
 import time
+import sys
+import os
 
 import crtk
 import dvrk
@@ -14,6 +16,21 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from retraction_interface.srv import GenerateGoalPointCloud
 from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+
+
+
+PUSHVIBES_ROOT = os.path.expanduser('~/retraction_ws/src/PushVIBES')
+if PUSHVIBES_ROOT not in sys.path:
+    sys.path.insert(0, PUSHVIBES_ROOT)
+# ROOT = os.path.expanduser('~/retraction_ws/src')
+# if ROOT not in sys.path:
+#     sys.path.insert(0, ROOT)
+
+from deploy_push import DeployPushVIBES, DeployPushDeterministic, DeployPushHeuristic
+
 
 # Latched, so a late subscriber gets the last snapshot right away instead of waiting for the next timer tick
 SNAPSHOT_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -65,6 +82,18 @@ class RetractionExperimentsNode(Node):
 
         # Republish the snapshots so they can be visualized, and reach subscribers that joined late
         self.snapshot_timer = self.create_timer(1.0 / snapshot_publish_rate, self.publish_snapshots)
+
+        # Rviz marker(s)
+        self.pushvibes_traj_marker = None
+        self.marker_pub = self.create_publisher(MarkerArray, '/pushvibes_trajectory_marker', SNAPSHOT_QOS)
+        self.marker_pub_rate = 5.0  # Hz
+        self.marker_pub_timer = self.create_timer(1.0 / self.marker_pub_rate, self.publish_rviz_traj_marker)
+        
+
+        ###
+
+        self.pushvibes_deployer = DeployPushVIBES(weights_path=os.path.expanduser("~/model_weights/PushVIBES/561real_561sim_lr1e4_cotrainlocal_20260323_131410.pt"),
+                                                  basis_path="./bps/bps_basis_r1.0_n128.npy")
 
         self.get_logger().info('Retraction experiments node initialized.')
 
@@ -169,6 +198,59 @@ class RetractionExperimentsNode(Node):
         self.get_logger().info('Snapshotted current point cloud as the goal point cloud.')
         return True
 
+    def set_rviz_traj_marker(self, start_point, end_point, frame_id="camera_color_optical_frame"):
+        """Set the Rviz markers for the predicted trajectory.
+
+        A single ARROW marker can only have one color, so the trajectory is drawn as three
+        markers: a bright green shaft, an electric blue arrow head and a cherry red start ball.
+        """
+        start = [float(v) for v in start_point]
+        end = [float(v) for v in end_point]
+        length = math.dist(start, end)
+        direction = [(e - s) / length for s, e in zip(start, end)] if length > 0 else [0.0, 0.0, 0.0]
+        head_length = min(0.0052, 0.52 * length)
+        head_base = [e - head_length * d for e, d in zip(end, direction)]
+        stamp = self.get_clock().now().to_msg()
+
+        def make_marker(marker_id, marker_type, rgb):
+            marker = Marker()
+            marker.header.frame_id = frame_id
+            marker.header.stamp = stamp
+            marker.ns = "pushvibes_trajectory"
+            marker.id = marker_id
+            marker.type = marker_type
+            marker.action = Marker.ADD
+            marker.color.r, marker.color.g, marker.color.b = rgb
+            marker.color.a = 1.0
+            return marker
+
+        # Shaft: bright green line from the start point to the base of the arrow head
+        shaft = make_marker(0, Marker.LINE_STRIP, (0.0, 1.0, 0.0))
+        shaft.scale.x = 0.0026  # Line width in meters
+        shaft.points = [Point(x=start[0], y=start[1], z=start[2]),
+                        Point(x=head_base[0], y=head_base[1], z=head_base[2])]
+
+        # Head: electric blue arrow spanning only the head, so no shaft is drawn
+        head = make_marker(1, Marker.ARROW, (0.1, 0.7, 1.0))
+        head.scale.x = 0.0026  # Shaft diameter (unused, shaft has zero length)
+        head.scale.y = 0.0065  # Head diameter
+        head.scale.z = head_length  # Head length
+        head.points = [Point(x=head_base[0], y=head_base[1], z=head_base[2]),
+                       Point(x=end[0], y=end[1], z=end[2])]
+
+        # Start: cherry red ball
+        ball = make_marker(2, Marker.SPHERE, (1.0, 0.05, 0.15))
+        ball.pose.position = Point(x=start[0], y=start[1], z=start[2])
+        ball.pose.orientation.w = 1.0
+        ball.scale.x = ball.scale.y = ball.scale.z = 0.0052  # Diameter in meters
+
+        self.pushvibes_traj_marker = MarkerArray(markers=[shaft, head, ball])
+
+    def publish_rviz_traj_marker(self):
+        """Publish the Rviz marker for the predicted trajectory."""
+        if self.pushvibes_traj_marker is not None:
+            self.marker_pub.publish(self.pushvibes_traj_marker)
+
     # ===========================
     # DVRK MOTION
     # ===========================
@@ -218,34 +300,61 @@ class RetractionExperimentsNode(Node):
         """Main blocking experiment loop. Runs on the main thread while callbacks spin in the background."""
         iteration = 0
 
-        if input(f'Ensure the {self.dvrk_arm_name} gripper is closed and the wrist is oriented straight down. Press Enter to continue (q to quit): ').strip().lower() == 'q':
-            return
+        if not self.psm.enable(10):
+            sys.exit('failed to enable within 10 seconds')
+
+        # if input(f'Ensure the {self.dvrk_arm_name} gripper is closed and the wrist is oriented straight down. Press Enter to continue (q to quit): ').strip().lower() == 'q':
+        #     return
         
-        dvrk_wrist_orientation = self.psm.measured_cp(wait_timeout=2.0)[0].M # type is PyKDL.Rotation
+        # dvrk_wrist_orientation = self.psm.measured_cp(wait_timeout=2.0)[0].M # type is PyKDL.Rotation
 
-        if input(f'Ensure the {self.dvrk_arm_name} end effector has 5cm of space around it for testing. Press Enter to continue (q to quit): ').strip().lower() == 'q':
-            return
-
-        self.get_logger().info(f'Moving {self.dvrk_arm_name} in small test path.')
-
-        # Move the arm 2 cm back and forth in x to verify the arm can move
-        for dx in [-0.02, 0.02]:
-            goal = PyKDL.Frame(dvrk_wrist_orientation, self.psm.measured_cp(wait_timeout=2.0)[0].p + PyKDL.Vector(dx, 0.0, 0.0))
-            self.move_cp_linear(goal, step_size=0.002, speed=0.03)
+        # if input(f'Ensure the {self.dvrk_arm_name} end effector has 5cm of space around it for testing. Press Enter to continue (q to quit): ').strip().lower() == 'q':
+        #     return
 
 
+        # self.get_logger().info(f'Moving {self.dvrk_arm_name} in small test path.')
+
+        # # Move the arm 1 cm back and forth in x to verify the arm can move
+        # for dx in [-0.01, 0.01, 0.01, -0.01]:
+        #     goal = PyKDL.Frame(dvrk_wrist_orientation, self.psm.measured_cp(wait_timeout=2.0)[0].p + PyKDL.Vector(dx, 0.0, 0.0))
+        #     self.move_cp_linear(goal, step_size=0.0005, speed=0.005)
+
+        self.get_logger().info("Done moving.")
+
+        input(f'Record goal (Enter)')
+
+        if not self.snapshot_current_pc_for_goal_pc():
+            self.get_logger().error('Failed to snapshot current point cloud for goal.')
 
         while rclpy.ok():
             if input(f'Press Enter to run iteration {iteration} (q to quit): ').strip().lower() == 'q':
                 break
 
+            self.snapshot_current_pc()
+
+            if self.current_pc_snapshot.header.frame_id != self.goal_pc_snapshot.header.frame_id:
+                self.get_logger().error(f'Current point cloud frame_id ({self.current_pc_snapshot.header.frame_id}) does not match goal point cloud frame_id ({self.goal_pc_snapshot.header.frame_id}).')
+                break
+
+            current_pc_numpy  = point_cloud2.read_points_numpy(
+                self.current_pc_snapshot, 
+                field_names=['x', 'y', 'z'], 
+                skip_nans=True
+            )
+
+            goal_pc_numpy  = point_cloud2.read_points_numpy(
+                self.goal_pc_snapshot, 
+                field_names=['x', 'y', 'z'], 
+                skip_nans=True
+            )
+
+            predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+
+            self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
 
             
-            self.run_iteration(iteration)
             iteration += 1
 
-    def run_iteration(self, iteration):
-        print(f'Running iteration {iteration}')
 
 
 # ===========================
