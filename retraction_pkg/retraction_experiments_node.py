@@ -239,6 +239,7 @@ class RetractionExperimentsNode(Node):
             marker.action = Marker.ADD
             marker.color.r, marker.color.g, marker.color.b = rgb
             marker.color.a = 1.0
+            marker.lifetime = Duration(seconds=3.0).to_msg()  # Republished at marker_pub_rate, so they only expire once the node stops
             return marker
 
         # Shaft: bright green line from the start point to the base of the arrow head
