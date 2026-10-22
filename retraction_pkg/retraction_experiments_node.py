@@ -11,14 +11,17 @@ import crtk
 import dvrk
 import PyKDL
 import rclpy
+from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from rclpy.time import Time
 from retraction_interface.srv import GenerateGoalPointCloud
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
+from tf2_ros import Buffer, TransformListener
 
 
 
@@ -35,11 +38,14 @@ from deploy_push import DeployPushVIBES, DeployPushDeterministic, DeployPushHeur
 # Latched, so a late subscriber gets the last snapshot right away instead of waiting for the next timer tick
 SNAPSHOT_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
+DVRK_PSM_BASE_FRAME = 'PSM1_base_link' # use for sim only, since the real robot takes commands in the camera frame after hand-eye calibration.
+
 
 class RetractionExperimentsNode(Node):
 
     def __init__(self,
                  dvrk_arm_name='PSM1',
+                 robot_mode='sim',
                  current_pc_topic='/tissue_pointcloud',
                  context_pc_topic='/context_pointcloud',
                  goal_service_name='/generate_goal_pointcloud',
@@ -50,6 +56,14 @@ class RetractionExperimentsNode(Node):
         self.service_timeout_sec = service_timeout_sec
 
         self.dvrk_arm_name = dvrk_arm_name
+
+        # 'real': the robot takes commands in the point cloud (camera) frame, so predicted points are sent as is.
+        # 'sim': the robot takes commands in DVRK_PSM_BASE_FRAME, so predicted points are transformed there with TF first.
+        if robot_mode not in ('real', 'sim'):
+            raise ValueError(f"robot_mode must be 'real' or 'sim', got {robot_mode!r}")
+        self.robot_mode = robot_mode
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Latest clouds, written by the subscriber callbacks on the executor thread
         self._lock = threading.Lock()
@@ -246,6 +260,14 @@ class RetractionExperimentsNode(Node):
 
         self.pushvibes_traj_marker = MarkerArray(markers=[shaft, head, ball])
 
+    def mark_marker_as_complete(self):
+        """Change the color of the trajectory markers to a dark green, to indicate the trajectory has been executed."""
+        if self.pushvibes_traj_marker is not None:
+            for marker in self.pushvibes_traj_marker.markers:
+                marker.color.r = 0.0
+                marker.color.g = 0.3
+                marker.color.b = 0.0
+
     def publish_rviz_traj_marker(self):
         """Publish the Rviz marker for the predicted trajectory."""
         if self.pushvibes_traj_marker is not None:
@@ -255,7 +277,7 @@ class RetractionExperimentsNode(Node):
     # DVRK MOTION
     # ===========================
     def move_cp_linear(self, goal, step_size=0.002, speed=0.03):
-        """Move the dVRK in a straight line to goal (PyKDL.Frame) at speed (m/s).
+        """Move the dVRK in a straight line to goal (PyKDL.Frame) at speed (m/s), blocking until the goal is reached.
 
         The line is split into waypoints about step_size meters apart (orientation is
         interpolated along with position), and each one is sent with move_cp on a fixed
@@ -293,6 +315,14 @@ class RetractionExperimentsNode(Node):
                 time.sleep(max(0.0, t_start + i * dt - time.monotonic()))
         handle.wait()
 
+    def transform_points(self, vectors, source_frame, target_frame):
+        """Transform PyKDL.Vectors from source_frame to target_frame using TF."""
+        tf = self.tf_buffer.lookup_transform(target_frame, source_frame, Time(),
+                                             timeout=Duration(seconds=2.0)).transform
+        T = PyKDL.Frame(PyKDL.Rotation.Quaternion(tf.rotation.x, tf.rotation.y, tf.rotation.z, tf.rotation.w),
+                        PyKDL.Vector(tf.translation.x, tf.translation.y, tf.translation.z))
+        return [T * v for v in vectors]
+
     # ===========================
     # EXPERIMENT LOOP
     # ===========================
@@ -319,41 +349,70 @@ class RetractionExperimentsNode(Node):
         #     goal = PyKDL.Frame(dvrk_wrist_orientation, self.psm.measured_cp(wait_timeout=2.0)[0].p + PyKDL.Vector(dx, 0.0, 0.0))
         #     self.move_cp_linear(goal, step_size=0.0005, speed=0.005)
 
-        self.get_logger().info("Done moving.")
+        # Every push keeps the wrist orientation the arm had at the start of the experiment,
+        # and the arm returns to this pose when the experiments are finished
+        original_pose = self.psm.setpoint_cp(wait_timeout=2.0)[0]
+        original_orientation = original_pose.M
+        original_position = original_pose.p
+
+        self.get_logger().info(f'Robot mode: {self.robot_mode}.')
 
         input(f'Record goal (Enter)')
 
         if not self.snapshot_current_pc_for_goal_pc():
             self.get_logger().error('Failed to snapshot current point cloud for goal.')
 
-        while rclpy.ok():
-            if input(f'Press Enter to run iteration {iteration} (q to quit): ').strip().lower() == 'q':
-                break
+        # Return to the original pose however the loop ends: q, an error, or Ctrl-C
+        try:
+            while rclpy.ok():
+                if input(f'Press Enter to run iteration {iteration} (q to quit): ').strip().lower() == 'q':
+                    break
 
-            self.snapshot_current_pc()
+                self.snapshot_current_pc()
 
-            if self.current_pc_snapshot.header.frame_id != self.goal_pc_snapshot.header.frame_id:
-                self.get_logger().error(f'Current point cloud frame_id ({self.current_pc_snapshot.header.frame_id}) does not match goal point cloud frame_id ({self.goal_pc_snapshot.header.frame_id}).')
-                break
+                if self.current_pc_snapshot.header.frame_id != self.goal_pc_snapshot.header.frame_id:
+                    self.get_logger().error(f'Current point cloud frame_id ({self.current_pc_snapshot.header.frame_id}) does not match goal point cloud frame_id ({self.goal_pc_snapshot.header.frame_id}).')
+                    break
 
-            current_pc_numpy  = point_cloud2.read_points_numpy(
-                self.current_pc_snapshot, 
-                field_names=['x', 'y', 'z'], 
-                skip_nans=True
-            )
+                current_pc_numpy  = point_cloud2.read_points_numpy(
+                    self.current_pc_snapshot, 
+                    field_names=['x', 'y', 'z'], 
+                    skip_nans=True
+                )
 
-            goal_pc_numpy  = point_cloud2.read_points_numpy(
-                self.goal_pc_snapshot, 
-                field_names=['x', 'y', 'z'], 
-                skip_nans=True
-            )
+                goal_pc_numpy  = point_cloud2.read_points_numpy(
+                    self.goal_pc_snapshot, 
+                    field_names=['x', 'y', 'z'], 
+                    skip_nans=True
+                )
 
-            predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+                predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
 
-            self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
+                self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
 
-            
-            iteration += 1
+                start_p = PyKDL.Vector(*(float(v) for v in predicted_start_point))
+                end_p = PyKDL.Vector(*(float(v) for v in predicted_end_point))
+
+                # Real: the robot takes commands in the point cloud (camera) frame, so the points are used as is.
+                # Sim: the robot takes commands in DVRK_PSM_BASE_FRAME, so transform the points there first.
+                if self.robot_mode == 'sim':
+                    start_p, end_p = self.transform_points([start_p, end_p],
+                                                           self.current_pc_snapshot.header.frame_id,
+                                                           DVRK_PSM_BASE_FRAME)
+                self.get_logger().info(f'Moving to start point {list(start_p)}.')
+                self.move_cp_linear(PyKDL.Frame(original_orientation, start_p))
+                time.sleep(1.0)
+                self.get_logger().info(f'Moving to end point {list(end_p)}.')
+                self.move_cp_linear(PyKDL.Frame(original_orientation, end_p))
+                self.mark_marker_as_complete()
+
+                iteration += 1
+        finally:
+            self.get_logger().info(f'Returning to original pose {list(original_position)}.')
+            try:
+                self.move_cp_linear(PyKDL.Frame(original_orientation, original_position))
+            except Exception as e:
+                self.get_logger().error(f'Failed to return to original pose: {e}')
 
 
 
@@ -362,7 +421,7 @@ class RetractionExperimentsNode(Node):
 # ===========================
 def main(args=None):
     rclpy.init(args=args)
-    node = RetractionExperimentsNode()
+    node = RetractionExperimentsNode(robot_mode='sim')
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
     # experiment loop can block on the main thread

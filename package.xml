@@ -9,6 +9,7 @@
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>retraction_interface</exec_depend>
   <exec_depend>dvrk_python</exec_depend>
