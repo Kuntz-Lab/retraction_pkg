@@ -50,7 +50,8 @@ class RetractionExperimentsNode(Node):
                  context_pc_topic='/context_pointcloud',
                  goal_service_name='/generate_goal_pointcloud',
                  service_timeout_sec=60.0,
-                 snapshot_publish_rate=0.5):
+                 snapshot_publish_rate=0.5,
+                 show_traj_history=True):
         super().__init__('retraction_experiments_node')
 
         self.service_timeout_sec = service_timeout_sec
@@ -97,8 +98,10 @@ class RetractionExperimentsNode(Node):
         # Republish the snapshots so they can be visualized, and reach subscribers that joined late
         self.snapshot_timer = self.create_timer(1.0 / snapshot_publish_rate, self.publish_snapshots)
 
-        # Rviz marker(s)
+        # Rviz marker(s). With show_traj_history, executed trajectories stay up in dark green
         self.pushvibes_traj_marker = None
+        self.show_traj_history = show_traj_history
+        self.executed_traj_markers = []  # Markers of executed trajectories, only kept if show_traj_history
         self.marker_pub = self.create_publisher(MarkerArray, '/pushvibes_trajectory_marker', SNAPSHOT_QOS)
         self.marker_pub_rate = 5.0  # Hz
         self.marker_pub_timer = self.create_timer(1.0 / self.marker_pub_rate, self.publish_rviz_traj_marker)
@@ -261,17 +264,31 @@ class RetractionExperimentsNode(Node):
         self.pushvibes_traj_marker = MarkerArray(markers=[shaft, head, ball])
 
     def mark_marker_as_complete(self):
-        """Change the color of the trajectory markers to a dark green, to indicate the trajectory has been executed."""
+        """Change the color of the trajectory markers to a dark green, to indicate the trajectory has been executed.
+
+        With show_traj_history, the markers move to the history (own namespace and ids, so the next
+        prediction doesn't overwrite them) and stay up for the rest of the experiment.
+        """
         if self.pushvibes_traj_marker is not None:
             for marker in self.pushvibes_traj_marker.markers:
                 marker.color.r = 0.0
                 marker.color.g = 0.3
                 marker.color.b = 0.0
 
+            if self.show_traj_history:
+                for marker in self.pushvibes_traj_marker.markers:
+                    marker.ns = "pushvibes_trajectory_history"
+                    marker.id = len(self.executed_traj_markers)
+                    self.executed_traj_markers.append(marker)
+                self.pushvibes_traj_marker = None
+
     def publish_rviz_traj_marker(self):
-        """Publish the Rviz marker for the predicted trajectory."""
+        """Publish the Rviz markers for the executed trajectories (if show_traj_history) and the predicted trajectory."""
+        markers = list(self.executed_traj_markers)
         if self.pushvibes_traj_marker is not None:
-            self.marker_pub.publish(self.pushvibes_traj_marker)
+            markers += self.pushvibes_traj_marker.markers
+        if markers:
+            self.marker_pub.publish(MarkerArray(markers=markers))
 
     # ===========================
     # DVRK MOTION
@@ -386,7 +403,20 @@ class RetractionExperimentsNode(Node):
                     skip_nans=True
                 )
 
-                predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+                # First push: plain PushVIBES. After that, optimize the push to start at the measured tool tip
+                # (point cloud frame), so the tool doesn't have to reposition between pushes.
+                if iteration == 0:
+                    predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+                else:
+                    tip_p = self.psm.measured_cp(wait_timeout=2.0)[0].p
+                    # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
+                    if self.robot_mode == 'sim':
+                        tip_p = self.transform_points([tip_p], DVRK_PSM_BASE_FRAME,
+                                                      self.current_pc_snapshot.header.frame_id)[0]
+                    tip_position = [tip_p.x(), tip_p.y(), tip_p.z()]
+                    predicted_start_point, predicted_end_point, _history = self.pushvibes_deployer.predict_push_start_point_optimized(
+                        current_pc_numpy, goal_pc_numpy, tip_position, visualize_single=False)
+                    self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, tip_position) * 1000:.2f} mm from the measured tool tip.')
 
                 self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
 
@@ -421,7 +451,7 @@ class RetractionExperimentsNode(Node):
 # ===========================
 def main(args=None):
     rclpy.init(args=args)
-    node = RetractionExperimentsNode(robot_mode='sim')
+    node = RetractionExperimentsNode(robot_mode='sim', show_traj_history=True)
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
     # experiment loop can block on the main thread
