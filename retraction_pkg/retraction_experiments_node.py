@@ -46,6 +46,7 @@ class RetractionExperimentsNode(Node):
     def __init__(self,
                  dvrk_arm_name='PSM1',
                  robot_mode='sim',
+                 push_method='PushVIBES_start_point_optimized', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
                  current_pc_topic='/tissue_pointcloud',
                  context_pc_topic='/context_pointcloud',
                  goal_service_name='/generate_goal_pointcloud',
@@ -57,6 +58,8 @@ class RetractionExperimentsNode(Node):
         self.service_timeout_sec = service_timeout_sec
 
         self.dvrk_arm_name = dvrk_arm_name
+
+        self.push_method = push_method
 
         # 'real': the robot takes commands in the point cloud (camera) frame, so predicted points are sent as is.
         # 'sim': the robot takes commands in DVRK_PSM_BASE_FRAME, so predicted points are transformed there with TF first.
@@ -407,17 +410,32 @@ class RetractionExperimentsNode(Node):
                 # First push: plain PushVIBES. After that, optimize the push to start at the measured tool tip
                 # (point cloud frame), so the tool doesn't have to reposition between pushes.
                 if iteration == 0:
-                    predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+
+                    # Method selection
+                    if self.push_method == 'PushVIBES_start_point_optimized' or self.push_method == 'PushVIBES_start_point_conditioned':
+                        predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+                
+                
+                
+                
                 else:
-                    tip_p = self.psm.measured_cp(wait_timeout=2.0)[0].p
+                    wrist_p = self.psm.measured_cp(wait_timeout=2.0)[0].p
                     # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
                     if self.robot_mode == 'sim':
-                        tip_p = self.transform_points([tip_p], DVRK_PSM_BASE_FRAME,
+                        wrist_p = self.transform_points([wrist_p], DVRK_PSM_BASE_FRAME,
                                                       self.current_pc_snapshot.header.frame_id)[0]
-                    tip_position = [tip_p.x(), tip_p.y(), tip_p.z()]
-                    predicted_start_point, predicted_end_point, _history = self.pushvibes_deployer.predict_push_start_point_optimized(
-                        current_pc_numpy, goal_pc_numpy, tip_position, visualize_single=False)
-                    self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, tip_position) * 1000:.2f} mm from the measured tool tip.')
+                    wrist_position = [wrist_p.x(), wrist_p.y(), wrist_p.z()]
+
+
+                    # Method selection
+                    if self.push_method == 'PushVIBES_start_point_optimized':
+                        predicted_start_point, predicted_end_point, _history = self.pushvibes_deployer.predict_push_start_point_optimized(
+                            current_pc_numpy, goal_pc_numpy, wrist_position, visualize_single=False)
+
+
+
+                    
+                    self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, wrist_position) * 1000:.2f} mm from the measured tool tip.')
 
                 self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
 
@@ -452,7 +470,9 @@ class RetractionExperimentsNode(Node):
 # ===========================
 def main(args=None):
     rclpy.init(args=args)
-    node = RetractionExperimentsNode(robot_mode='sim', show_traj_history=True)
+    node = RetractionExperimentsNode(robot_mode='sim', 
+                                     push_method='PushVIBES_start_point_optimized', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
+                                     show_traj_history=True)
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
     # experiment loop can block on the main thread
