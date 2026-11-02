@@ -519,6 +519,15 @@ class RetractionExperimentsNode(Node):
         height = np.clip(height, clearance, self.workspace_height - clearance)
         return False, origin + in_plane[0] * x_axis + in_plane[1] * y_axis + height * z_axis
 
+    def keep_point_in_workspace(self, point, name):
+        """Return point as a numpy array, moved into the workspace if it's outside, with a warning naming the point."""
+        point = np.asarray(point, dtype=float)
+        safe, checked_point = self.check_point_in_workspace(point)
+        if not safe:
+            self.get_logger().warn(f'Predicted {name} point is outside the workspace; moved it '
+                                   f'{np.linalg.norm(checked_point - point) * 1000:.1f} mm to {checked_point.tolist()}.')
+        return checked_point
+
     # ===========================
     # DVRK MOTION
     # ===========================
@@ -620,6 +629,11 @@ class RetractionExperimentsNode(Node):
                     self.get_logger().error(f'Current point cloud frame_id ({self.current_pc_snapshot.header.frame_id}) does not match goal point cloud frame_id ({self.goal_pc_snapshot.header.frame_id}).')
                     break
 
+                # The workspace is defined in PLANE_FRAME, so predicted points can only be checked in that frame
+                if self.robot_mode == 'real' and self.current_pc_snapshot.header.frame_id != PLANE_FRAME:
+                    self.get_logger().error(f'Current point cloud frame_id ({self.current_pc_snapshot.header.frame_id}) does not match the workspace frame ({PLANE_FRAME}).')
+                    break
+
                 current_pc_numpy  = point_cloud2.read_points_numpy(
                     self.current_pc_snapshot, 
                     field_names=['x', 'y', 'z'], 
@@ -644,7 +658,7 @@ class RetractionExperimentsNode(Node):
                 
                 
                 else:
-                    wrist_p = self.psm.measured_cp(wait_timeout=2.0)[0].p
+                    wrist_p = self.psm.setpoint_cp(wait_timeout=2.0)[0].p
                     # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
                     if self.robot_mode == 'sim':
                         wrist_p = self.transform_points([wrist_p], DVRK_PSM_BASE_FRAME,
@@ -661,6 +675,11 @@ class RetractionExperimentsNode(Node):
 
                     
                     self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, wrist_position) * 1000:.2f} mm from the measured tool tip.')
+
+                # Real robot only. Before the marker and the prompt below, so what's shown and confirmed is what gets executed
+                if self.robot_mode == 'real':
+                    predicted_start_point = self.keep_point_in_workspace(predicted_start_point, 'start')
+                    predicted_end_point = self.keep_point_in_workspace(predicted_end_point, 'end')
 
                 self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
 
