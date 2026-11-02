@@ -6,6 +6,7 @@ import threading
 import time
 import sys
 import os
+import numpy as np
 
 import crtk
 import dvrk
@@ -23,6 +24,33 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from tf2_ros import Buffer, TransformListener
 
+
+# Define table plane in camera_color_optical_frame
+PLANE_FRAME = 'camera_color_optical_frame'
+
+PLANE_POINTS = [
+    np.array([0.021911092446555286, 0.06784100530667117, 0.18549440839995876]),
+    np.array([-0.08994168808681319, 0.05856682040941594, 0.21703163195042452]),
+    np.array([-0.03985805694134603, 0.01761314976124996, 0.3216261340978672])
+]
+
+POINT_ON_OPERATING_SIDE_OF_PLANE = np.array([-0.04724825116424486, -0.015205646801040293, 0.20428739561993214])  # Point on the side of the plane where the robot operates (for normal direction)
+
+
+def plane_normal(plane_points, point_on_operating_side):
+    """Return the unit normal of the plane through plane_points, pointing to the side of point_on_operating_side."""
+    p0, p1, p2 = plane_points
+    normal = np.cross(p1 - p0, p2 - p0)
+    normal /= np.linalg.norm(normal)
+    if np.dot(point_on_operating_side - p0, normal) < 0:
+        normal = -normal
+    return normal
+
+
+def offset_plane_points(plane_points, point_on_operating_side, offset_mm):
+    """Return plane_points moved offset_mm along the plane normal, away from point_on_operating_side."""
+    normal = plane_normal(plane_points, point_on_operating_side)
+    return [point - offset_mm / 1000.0 * normal for point in plane_points]
 
 
 PUSHVIBES_ROOT = os.path.expanduser('~/retraction_ws/src/PushVIBES')
@@ -52,7 +80,8 @@ class RetractionExperimentsNode(Node):
                  goal_service_name='/generate_goal_pointcloud',
                  service_timeout_sec=60.0,
                  snapshot_publish_rate=0.5,
-                 show_traj_history=True):
+                 show_traj_history=True,
+                 plane_offset_mm=0.0):
         super().__init__('retraction_experiments_node')
 
         self.service_timeout_sec = service_timeout_sec
@@ -108,7 +137,15 @@ class RetractionExperimentsNode(Node):
         self.marker_pub = self.create_publisher(MarkerArray, '/pushvibes_trajectory_marker', SNAPSHOT_QOS)
         self.marker_pub_rate = 5.0  # Hz
         self.marker_pub_timer = self.create_timer(1.0 / self.marker_pub_rate, self.publish_rviz_traj_marker)
-        
+
+        # PLANE_POINTS sit a fixed offset above the table, so move the plane down onto it
+        self.plane_points = offset_plane_points(PLANE_POINTS, POINT_ON_OPERATING_SIDE_OF_PLANE, plane_offset_mm)
+
+        # Rviz marker for the table plane
+        self.plane_marker = self.make_plane_marker()
+        self.plane_marker_pub = self.create_publisher(Marker, '/table_plane_marker', SNAPSHOT_QOS)
+        self.plane_marker_pub_rate = 2.0  # Hz
+        self.plane_marker_pub_timer = self.create_timer(1.0 / self.plane_marker_pub_rate, self.publish_plane_marker)
 
         ###
 
@@ -294,6 +331,54 @@ class RetractionExperimentsNode(Node):
         if markers:
             self.marker_pub.publish(MarkerArray(markers=markers))
 
+    def make_plane_marker(self, frame_id=PLANE_FRAME, size=0.6, thickness=0.001):
+        """Make a Rviz marker for the table plane: a thin square, size meters wide, centered on plane_points.
+
+        Rviz has no plane marker, so this is a CUBE flattened along its z axis, which is the plane normal.
+        """
+        p0, p1, _ = self.plane_points
+        x_axis = (p1 - p0) / np.linalg.norm(p1 - p0)
+        z_axis = plane_normal(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE)
+        y_axis = np.cross(z_axis, x_axis)
+        rotation = PyKDL.Rotation(*(PyKDL.Vector(*(float(v) for v in axis)) for axis in (x_axis, y_axis, z_axis)))
+
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.ns = "table_plane"
+        marker.id = 0
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+        center = np.mean(self.plane_points, axis=0)
+        marker.pose.position = Point(x=float(center[0]), y=float(center[1]), z=float(center[2]))
+        (marker.pose.orientation.x, marker.pose.orientation.y,
+         marker.pose.orientation.z, marker.pose.orientation.w) = rotation.GetQuaternion()
+        marker.scale.x = marker.scale.y = size
+        marker.scale.z = thickness
+        marker.color.r, marker.color.g, marker.color.b = 0.3, 0.6, 1.0
+        marker.color.a = 0.4
+        marker.lifetime = Duration(seconds=3.0).to_msg()  # Republished at plane_marker_pub_rate, so it only expires once the node stops
+        return marker
+
+    def publish_plane_marker(self):
+        """Publish the Rviz marker for the table plane."""
+        self.plane_marker.header.stamp = self.get_clock().now().to_msg()
+        self.plane_marker_pub.publish(self.plane_marker)
+
+    # ===========================
+    # WORKSPACE CHECK
+    # ===========================
+    def check_point_above_plane(self, point, clearance_mm=4.0):
+        """Check a single xyz numpy array, in PLANE_FRAME, against the table plane.
+
+        Returns (True, point) if the point is on or above the plane. Otherwise returns
+        (False, closest_point), where closest_point is the nearest point clearance_mm above the plane.
+        """
+        normal = plane_normal(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE)
+        height = np.dot(point - self.plane_points[0], normal)  # Signed distance, negative below the plane
+        if height >= 0:
+            return True, point
+        return False, point + (clearance_mm / 1000.0 - height) * normal
+
     # ===========================
     # DVRK MOTION
     # ===========================
@@ -439,6 +524,13 @@ class RetractionExperimentsNode(Node):
 
                 self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
 
+
+                # press enter to continue, anything else to quit
+                if not input(f'Press Enter to execute the push (q to quit): ').strip().lower() == '':
+                    break
+
+
+
                 start_p = PyKDL.Vector(*(float(v) for v in predicted_start_point))
                 end_p = PyKDL.Vector(*(float(v) for v in predicted_end_point))
 
@@ -470,9 +562,10 @@ class RetractionExperimentsNode(Node):
 # ===========================
 def main(args=None):
     rclpy.init(args=args)
-    node = RetractionExperimentsNode(robot_mode='sim', 
+    node = RetractionExperimentsNode(robot_mode='real', 
                                      push_method='PushVIBES_start_point_optimized', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
-                                     show_traj_history=True)
+                                     show_traj_history=True,
+                                     plane_offset_mm=7.0)  # How far the table sits below PLANE_POINTS, along the plane normal
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
     # experiment loop can block on the main thread
