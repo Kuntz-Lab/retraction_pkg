@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'retraction_experiments_node = retraction_pkg.retraction_experiments_node:main'
+            'retraction_experiments_node = retraction_pkg.retraction_experiments_node:main',
+            'workspace_recorder_node = retraction_pkg.workspace_recorder_node:main'
         ],
     },
 )

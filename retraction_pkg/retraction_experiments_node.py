@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run retraction experiments from snapshots of the live tissue and context point clouds."""
 
+import json
 import math
 import threading
 import time
@@ -53,6 +54,86 @@ def offset_plane_points(plane_points, point_on_operating_side, offset_mm):
     return [point - offset_mm / 1000.0 * normal for point in plane_points]
 
 
+def plane_axes(plane_points, point_on_operating_side):
+    """Return unit (x, y, z) axes of a right-handed frame on the plane, with z the plane normal."""
+    p0, p1, _ = plane_points
+    x_axis = (p1 - p0) / np.linalg.norm(p1 - p0)
+    z_axis = plane_normal(plane_points, point_on_operating_side)
+    return x_axis, np.cross(z_axis, x_axis), z_axis
+
+
+def load_workspace_polygon(path, origin, x_axis, y_axis):
+    """Load a trace from workspace_recorder_node as an Nx2 polygon, in meters along x_axis and y_axis from origin.
+
+    The polygon keeps the recorded order, so it follows the trace even where the trace curves inward.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'No workspace boundary at {path}. Trace the workspace edge with workspace_recorder_node first.')
+    with open(path) as f:
+        boundary = json.load(f)
+    if boundary['frame_id'] != PLANE_FRAME:
+        raise ValueError(f"{path} is in frame {boundary['frame_id']!r}, expected {PLANE_FRAME!r}.")
+
+    points = np.array(boundary['points']).reshape(-1, 3)
+    polygon = (points - origin) @ np.stack([x_axis, y_axis], axis=1)
+
+    # The arm sits still at times during a trace, and repeated points would make zero length edges
+    keep = np.linalg.norm(polygon - np.roll(polygon, 1, axis=0), axis=1) > 1e-6
+    polygon = polygon[keep]
+    if len(polygon) < 3:
+        raise ValueError(f'{path} has {len(polygon)} distinct points, a polygon needs at least 3.')
+    return polygon
+
+
+def point_in_polygon(point, polygon):
+    """Return True if the 2D point is inside polygon, by winding number so a trace that overlaps its start stays filled."""
+    x, y = point
+    starts = polygon
+    ends = np.roll(polygon, -1, axis=0)
+    edges = ends - starts
+    side = edges[:, 0] * (y - starts[:, 1]) - edges[:, 1] * (x - starts[:, 0])  # Positive if point is left of the edge
+    crosses_up = (starts[:, 1] <= y) & (ends[:, 1] > y) & (side > 0)
+    crosses_down = (starts[:, 1] > y) & (ends[:, 1] <= y) & (side < 0)
+    return bool(np.sum(crosses_up) != np.sum(crosses_down))
+
+
+def closest_point_on_polygon(point, polygon):
+    """Return the point on the polygon's outline closest to the 2D point, and the index of its edge."""
+    edges = np.roll(polygon, -1, axis=0) - polygon
+    t = np.clip(np.sum((point - polygon) * edges, axis=1) / np.sum(edges * edges, axis=1), 0.0, 1.0)
+    closest = polygon + t[:, np.newaxis] * edges
+    index = int(np.argmin(np.linalg.norm(point - closest, axis=1)))
+    return closest[index], index
+
+
+def move_inside_polygon(point, polygon, clearance, tolerance=1e-6, max_iterations=2000):
+    """Return the 2D point moved the shortest way to be inside polygon, at least clearance from its outline.
+
+    Each step sets the distance to the nearest edge to clearance. Near a corner that can put the point too
+    close to the other edge, so this repeats until every edge is clear.
+    """
+    edges = np.roll(polygon, -1, axis=0) - polygon
+    counterclockwise = np.sum(polygon[:, 0] * np.roll(polygon, -1, axis=0)[:, 1]
+                              - np.roll(polygon, -1, axis=0)[:, 0] * polygon[:, 1]) > 0
+
+    for _ in range(max_iterations):
+        closest, edge_index = closest_point_on_polygon(point, polygon)
+        offset = point - closest
+        distance = np.linalg.norm(offset)
+        inside = point_in_polygon(point, polygon)
+        if inside and distance >= clearance - tolerance:
+            return point
+
+        if distance > 1e-9:
+            inward = offset / distance if inside else -offset / distance
+        else:  # On the outline, where offset is only rounding error, so use the normal of the edge instead
+            edge = edges[edge_index] / np.linalg.norm(edges[edge_index])
+            inward = np.array([-edge[1], edge[0]]) if counterclockwise else np.array([edge[1], -edge[0]])
+        point = closest + clearance * inward
+
+    raise ValueError(f'No point {clearance * 1000:.1f} mm inside the workspace polygon was found near the input.')
+
+
 PUSHVIBES_ROOT = os.path.expanduser('~/retraction_ws/src/PushVIBES')
 if PUSHVIBES_ROOT not in sys.path:
     sys.path.insert(0, PUSHVIBES_ROOT)
@@ -81,7 +162,9 @@ class RetractionExperimentsNode(Node):
                  service_timeout_sec=60.0,
                  snapshot_publish_rate=0.5,
                  show_traj_history=True,
-                 plane_offset_mm=0.0):
+                 plane_offset_mm=0.0,
+                 workspace_boundary_path='~/retraction_ws/workspace_boundary.json',
+                 workspace_height_mm=110.0):
         super().__init__('retraction_experiments_node')
 
         self.service_timeout_sec = service_timeout_sec
@@ -141,11 +224,24 @@ class RetractionExperimentsNode(Node):
         # PLANE_POINTS sit a fixed offset above the table, so move the plane down onto it
         self.plane_points = offset_plane_points(PLANE_POINTS, POINT_ON_OPERATING_SIDE_OF_PLANE, plane_offset_mm)
 
-        # Rviz marker for the table plane
-        self.plane_marker = self.make_plane_marker()
-        self.plane_marker_pub = self.create_publisher(Marker, '/table_plane_marker', SNAPSHOT_QOS)
-        self.plane_marker_pub_rate = 2.0  # Hz
-        self.plane_marker_pub_timer = self.create_timer(1.0 / self.plane_marker_pub_rate, self.publish_plane_marker)
+        # The workspace is the traced polygon, extended normal to the table from the table up to workspace_height
+        self.table_axes = plane_axes(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE)
+        self.workspace_height = workspace_height_mm / 1000.0
+        self.workspace_polygon = load_workspace_polygon(os.path.expanduser(workspace_boundary_path),
+                                                        self.plane_points[0], *self.table_axes[:2])
+        top_plane_points = offset_plane_points(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE, -workspace_height_mm)
+
+        # Rviz markers for the workspace, each on its own topic so they can be toggled separately
+        self.workspace_marker_pubs = [
+            (self.create_publisher(Marker, '/table_plane_marker', SNAPSHOT_QOS),
+             self.make_plane_marker(self.plane_points, 'table_plane', (0.3, 0.6, 1.0))),
+            (self.create_publisher(Marker, '/workspace_walls_marker', SNAPSHOT_QOS),
+             self.make_workspace_walls_marker()),
+            (self.create_publisher(Marker, '/workspace_top_marker', SNAPSHOT_QOS),
+             self.make_plane_marker(top_plane_points, 'workspace_top', (0.3, 1.0, 0.6))),
+        ]
+        self.workspace_marker_pub_rate = 2.0  # Hz
+        self.workspace_marker_pub_timer = self.create_timer(1.0 / self.workspace_marker_pub_rate, self.publish_workspace_markers)
 
         ###
 
@@ -331,38 +427,62 @@ class RetractionExperimentsNode(Node):
         if markers:
             self.marker_pub.publish(MarkerArray(markers=markers))
 
-    def make_plane_marker(self, frame_id=PLANE_FRAME, size=0.6, thickness=0.001):
-        """Make a Rviz marker for the table plane: a thin square, size meters wide, centered on plane_points.
+    def make_plane_marker(self, plane_points, ns, rgb, frame_id=PLANE_FRAME, size=0.6, thickness=0.001):
+        """Make a Rviz marker for a plane parallel to the table: a thin square, size meters wide, centered on plane_points.
 
         Rviz has no plane marker, so this is a CUBE flattened along its z axis, which is the plane normal.
         """
-        p0, p1, _ = self.plane_points
-        x_axis = (p1 - p0) / np.linalg.norm(p1 - p0)
-        z_axis = plane_normal(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE)
-        y_axis = np.cross(z_axis, x_axis)
-        rotation = PyKDL.Rotation(*(PyKDL.Vector(*(float(v) for v in axis)) for axis in (x_axis, y_axis, z_axis)))
+        rotation = PyKDL.Rotation(*(PyKDL.Vector(*(float(v) for v in axis)) for axis in self.table_axes))
 
         marker = Marker()
         marker.header.frame_id = frame_id
-        marker.ns = "table_plane"
+        marker.ns = ns
         marker.id = 0
         marker.type = Marker.CUBE
         marker.action = Marker.ADD
-        center = np.mean(self.plane_points, axis=0)
+        center = np.mean(plane_points, axis=0)
         marker.pose.position = Point(x=float(center[0]), y=float(center[1]), z=float(center[2]))
         (marker.pose.orientation.x, marker.pose.orientation.y,
          marker.pose.orientation.z, marker.pose.orientation.w) = rotation.GetQuaternion()
         marker.scale.x = marker.scale.y = size
         marker.scale.z = thickness
-        marker.color.r, marker.color.g, marker.color.b = 0.3, 0.6, 1.0
+        marker.color.r, marker.color.g, marker.color.b = rgb
         marker.color.a = 0.4
-        marker.lifetime = Duration(seconds=3.0).to_msg()  # Republished at plane_marker_pub_rate, so it only expires once the node stops
+        marker.lifetime = Duration(seconds=3.0).to_msg()  # Republished at workspace_marker_pub_rate, so it only expires once the node stops
         return marker
 
-    def publish_plane_marker(self):
-        """Publish the Rviz marker for the table plane."""
-        self.plane_marker.header.stamp = self.get_clock().now().to_msg()
-        self.plane_marker_pub.publish(self.plane_marker)
+    def make_workspace_walls_marker(self, frame_id=PLANE_FRAME):
+        """Make a Rviz marker for the workspace side walls: two triangles per polygon edge, from the table to the top."""
+        x_axis, y_axis, z_axis = self.table_axes
+        bottom = (self.plane_points[0] + self.workspace_polygon[:, [0]] * x_axis
+                  + self.workspace_polygon[:, [1]] * y_axis)
+        top = bottom + self.workspace_height * z_axis
+
+        triangles = []
+        for i in range(len(bottom)):
+            j = (i + 1) % len(bottom)
+            triangles += [bottom[i], bottom[j], top[j], bottom[i], top[j], top[i]]
+
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.ns = "workspace_walls"
+        marker.id = 0
+        marker.type = Marker.TRIANGLE_LIST
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = marker.scale.y = marker.scale.z = 1.0  # Rviz scales the points by this
+        marker.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in triangles]
+        marker.color.r, marker.color.g, marker.color.b = 1.0, 0.6, 0.2
+        marker.color.a = 0.25
+        marker.lifetime = Duration(seconds=3.0).to_msg()  # Republished at workspace_marker_pub_rate, so it only expires once the node stops
+        return marker
+
+    def publish_workspace_markers(self):
+        """Publish the Rviz markers for the table, the workspace walls and the top of the workspace."""
+        stamp = self.get_clock().now().to_msg()
+        for publisher, marker in self.workspace_marker_pubs:
+            marker.header.stamp = stamp
+            publisher.publish(marker)
 
     # ===========================
     # WORKSPACE CHECK
@@ -378,6 +498,26 @@ class RetractionExperimentsNode(Node):
         if height >= 0:
             return True, point
         return False, point + (clearance_mm / 1000.0 - height) * normal
+
+    def check_point_in_workspace(self, point, clearance_mm=4.0):
+        """Check a single xyz numpy array, in PLANE_FRAME, against the table, the walls and the top of the workspace.
+
+        Returns (True, point) if the point is inside or on the workspace. Otherwise returns (False, closest_point),
+        where closest_point is the nearest point at least clearance_mm from the table, the walls and the top.
+        """
+        clearance = clearance_mm / 1000.0
+        origin = self.plane_points[0]
+        x_axis, y_axis, z_axis = self.table_axes
+        relative = point - origin
+        in_plane = np.array([np.dot(relative, x_axis), np.dot(relative, y_axis)])
+        height = np.dot(relative, z_axis)
+
+        if 0.0 <= height <= self.workspace_height and point_in_polygon(in_plane, self.workspace_polygon):
+            return True, point
+
+        in_plane = move_inside_polygon(in_plane, self.workspace_polygon, clearance)
+        height = np.clip(height, clearance, self.workspace_height - clearance)
+        return False, origin + in_plane[0] * x_axis + in_plane[1] * y_axis + height * z_axis
 
     # ===========================
     # DVRK MOTION
@@ -565,7 +705,8 @@ def main(args=None):
     node = RetractionExperimentsNode(robot_mode='real', 
                                      push_method='PushVIBES_start_point_optimized', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
                                      show_traj_history=True,
-                                     plane_offset_mm=7.0)  # How far the table sits below PLANE_POINTS, along the plane normal
+                                     plane_offset_mm=7.0,  # How far the table sits below PLANE_POINTS, along the plane normal
+                                     workspace_height_mm=110.0)  # How far the top of the workspace sits above the table
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
     # experiment loop can block on the main thread
