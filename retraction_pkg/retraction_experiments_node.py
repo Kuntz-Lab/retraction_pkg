@@ -578,6 +578,24 @@ class RetractionExperimentsNode(Node):
                         PyKDL.Vector(tf.translation.x, tf.translation.y, tf.translation.z))
         return [T * v for v in vectors]
 
+    
+    # def get_chamfer_distances(which_camera):
+
+
+
+    #     chamfer_distances = {
+    #         "camera": ,
+    #         "avg_chamfer_dist_current_to_goal": ,
+    #         "avg_chamfer_dist_goal_to_current": ,
+    #         "avg_chamfer_dist_bidirectional": ,
+    #     }
+
+       
+        
+    #     return chamfer_distances
+
+        
+
     # ===========================
     # EXPERIMENT LOOP
     # ===========================
@@ -699,11 +717,66 @@ class RetractionExperimentsNode(Node):
                     start_p, end_p = self.transform_points([start_p, end_p],
                                                            self.current_pc_snapshot.header.frame_id,
                                                            DVRK_PSM_BASE_FRAME)
+
+
+                chamfer_pre_push = self.get_chamfer_distances()
+                
                 self.get_logger().info(f'Moving to start point {list(start_p)}.')
                 self.move_cp_linear(PyKDL.Frame(original_orientation, start_p))
                 time.sleep(1.0)
                 self.get_logger().info(f'Moving to end point {list(end_p)}.')
                 self.move_cp_linear(PyKDL.Frame(original_orientation, end_p))
+
+                time.sleep(1.0) # Wait for tissue to settle
+
+                chamfer_post_push = self.get_chamfer_distances()
+
+
+                # record data for iteration as .pickle file
+
+
+                # realsense_d405_data = {
+                #     "frame": ,
+                #     "transform_to_camera_color_optical": , # rename
+                #     "start_point_cloud": ,
+                #     # "start_point_cloud_downsampled": ,
+                #     # "start_point_cloud_downsampled_object_frame": ,
+                #     "final_point_cloud": ,
+                #     "goal_point_cloud": ,
+                #     # "goal_point_cloud_downsampled": ,
+                #     # "goal_point_cloud_downsampled_object_frame": ,
+                #     "context_point_cloud": ,
+                #     # "context_point_cloud_downsampled": ,
+                #     # "context_point_cloud_downsampled_object_frame": ,
+                #     "chamfer_pre_push": chamfer_pre_push,
+                #     "chamfer_post_push": chamfer_post_push
+
+                # }
+
+                # start_point_optimized_data = {
+                #     "optimization_history": ,
+                    
+                # }
+
+                # experiment_iteration_data = {
+                #     "method": ,
+                #     "iteration": iteration,
+                #     "prediction_frame": ,
+                    
+                #     "start_point_pred": ,
+                #     "end_point_pred": ,
+                #     "start_point_outside_workspace": ,
+                #     "end_point_outside_workspace": ,
+                #     "start_point_adjusted": ,
+                #     "end_point_adjusted": ,
+                #     "table_plane_points": [],
+                #     "executed_push": ,
+
+
+
+                # }
+
+
                 self.mark_marker_as_complete()
 
                 iteration += 1
