@@ -245,8 +245,9 @@ class RetractionExperimentsNode(Node):
 
         ###
 
-        self.pushvibes_deployer = DeployPushVIBES(weights_path=os.path.expanduser("~/model_weights/PushVIBES/561real_561sim_lr1e4_cotrainlocal_20260323_131410.pt"),
-                                                  basis_path="./bps/bps_basis_r1.0_n128.npy")
+        self.pushvibes_deployer = DeployPushVIBES(weights_path=os.path.expanduser("~/model_weights/PushVIBES/VIB/latest_model_weights.pt"),
+                                                  basis_path="./bps/bps_basis_r1.0_n128.npy",
+                                                  start_point_conditioned_weights_path=os.path.expanduser("~/model_weights/PushVIBES/VIB_start_point_conditioned/latest_model_weights.pt"))
 
         self.get_logger().info('Retraction experiments node initialized.')
 
@@ -664,8 +665,7 @@ class RetractionExperimentsNode(Node):
                     skip_nans=True
                 )
 
-                # First push: plain PushVIBES. After that, optimize the push to start at the measured tool tip
-                # (point cloud frame), so the tool doesn't have to reposition between pushes.
+                # First push
                 if iteration == 0:
 
                     # Method selection
@@ -675,6 +675,7 @@ class RetractionExperimentsNode(Node):
                 
                 
                 
+                # Subsequent pushes
                 else:
                     wrist_p = self.psm.setpoint_cp(wait_timeout=2.0)[0].p
                     # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
@@ -689,10 +690,15 @@ class RetractionExperimentsNode(Node):
                         predicted_start_point, predicted_end_point, _history = self.pushvibes_deployer.predict_push_start_point_optimized(
                             current_pc_numpy, goal_pc_numpy, wrist_position, visualize_single=False)
 
-
-
+                        self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, wrist_position) * 1000:.2f} mm from the measured tool tip.')
                     
-                    self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, wrist_position) * 1000:.2f} mm from the measured tool tip.')
+                    elif self.push_method == 'PushVIBES_start_point_conditioned':
+                        predicted_start_point, predicted_end_point = self.pushvibes_deployer.predict_push_start_point_conditioned(
+                            current_pc_numpy, goal_pc_numpy, wrist_position, visualize_single=False)
+
+
+                
+                    
 
                 # Real robot only. Before the marker and the prompt below, so what's shown and confirmed is what gets executed
                 if self.robot_mode == 'real':
@@ -795,9 +801,9 @@ class RetractionExperimentsNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RetractionExperimentsNode(robot_mode='real', 
-                                     push_method='PushVIBES_start_point_optimized', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
+                                     push_method='PushVIBES_start_point_conditioned', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
                                      show_traj_history=True,
-                                     plane_offset_mm=7.0,  # How far the table sits below PLANE_POINTS, along the plane normal
+                                     plane_offset_mm=2.0, #7.0  # How far the table sits below PLANE_POINTS, along the plane normal
                                      workspace_height_mm=110.0)  # How far the top of the workspace sits above the table
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
