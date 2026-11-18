@@ -134,6 +134,13 @@ def move_inside_polygon(point, polygon, clearance, tolerance=1e-6, max_iteration
     raise ValueError(f'No point {clearance * 1000:.1f} mm inside the workspace polygon was found near the input.')
 
 
+def clip_action(start_point, end_point, keep_ratio=1.0):
+    """Return the end point moved along the push so the push keeps keep_ratio of its original length."""
+    start = np.asarray(start_point, dtype=float)
+    push_vector = np.asarray(end_point, dtype=float) - start
+    return start + keep_ratio * push_vector
+
+
 PUSHVIBES_ROOT = os.path.expanduser('~/retraction_ws/src/PushVIBES')
 if PUSHVIBES_ROOT not in sys.path:
     sys.path.insert(0, PUSHVIBES_ROOT)
@@ -696,16 +703,14 @@ class RetractionExperimentsNode(Node):
                         predicted_start_point, predicted_end_point = self.pushvibes_deployer.predict_push_start_point_conditioned(
                             current_pc_numpy, goal_pc_numpy, wrist_position, visualize_single=False)
 
-
-                
-                    
+                clipped_end_point = clip_action(predicted_start_point, predicted_end_point, keep_ratio=0.25)
 
                 # Real robot only. Before the marker and the prompt below, so what's shown and confirmed is what gets executed
                 if self.robot_mode == 'real':
                     predicted_start_point = self.keep_point_in_workspace(predicted_start_point, 'start')
-                    predicted_end_point = self.keep_point_in_workspace(predicted_end_point, 'end')
+                    clipped_end_point = self.keep_point_in_workspace(clipped_end_point, 'end')
 
-                self.set_rviz_traj_marker(predicted_start_point, predicted_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
+                self.set_rviz_traj_marker(predicted_start_point, clipped_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
 
 
                 # press enter to continue, anything else to quit
@@ -715,7 +720,7 @@ class RetractionExperimentsNode(Node):
 
 
                 start_p = PyKDL.Vector(*(float(v) for v in predicted_start_point))
-                end_p = PyKDL.Vector(*(float(v) for v in predicted_end_point))
+                end_p = PyKDL.Vector(*(float(v) for v in clipped_end_point))
 
                 # Real: the robot takes commands in the point cloud (camera) frame, so the points are used as is.
                 # Sim: the robot takes commands in DVRK_PSM_BASE_FRAME, so transform the points there first.
@@ -725,7 +730,7 @@ class RetractionExperimentsNode(Node):
                                                            DVRK_PSM_BASE_FRAME)
 
 
-                chamfer_pre_push = self.get_chamfer_distances()
+                # chamfer_pre_push = self.get_chamfer_distances()
                 
                 self.get_logger().info(f'Moving to start point {list(start_p)}.')
                 self.move_cp_linear(PyKDL.Frame(original_orientation, start_p))
@@ -735,7 +740,7 @@ class RetractionExperimentsNode(Node):
 
                 time.sleep(1.0) # Wait for tissue to settle
 
-                chamfer_post_push = self.get_chamfer_distances()
+                # chamfer_post_push = self.get_chamfer_distances()
 
 
                 # record data for iteration as .pickle file
@@ -771,6 +776,7 @@ class RetractionExperimentsNode(Node):
                     
                 #     "start_point_pred": ,
                 #     "end_point_pred": ,
+                #     "end_point_clipped": ,
                 #     "start_point_outside_workspace": ,
                 #     "end_point_outside_workspace": ,
                 #     "start_point_adjusted": ,
@@ -803,7 +809,7 @@ def main(args=None):
     node = RetractionExperimentsNode(robot_mode='real', 
                                      push_method='PushVIBES_start_point_conditioned', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
                                      show_traj_history=True,
-                                     plane_offset_mm=2.0, #7.0  # How far the table sits below PLANE_POINTS, along the plane normal
+                                     plane_offset_mm=7.0, #7.0  # How far the table sits below PLANE_POINTS, along the plane normal
                                      workspace_height_mm=110.0)  # How far the top of the workspace sits above the table
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
