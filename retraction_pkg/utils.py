@@ -4,6 +4,12 @@ import json
 import os
 
 import numpy as np
+import PyKDL
+
+
+# Measured distance from the wrist (the wrist yaw axis, where setpoint_cp sits) to the tool tip, along the wrist z axis
+TOOL_TIP_OFFSET_M = 0.028
+WRIST_TO_TIP = PyKDL.Frame(PyKDL.Vector(0.0, 0.0, TOOL_TIP_OFFSET_M))
 
 
 # ===========================
@@ -121,6 +127,26 @@ def clip_action(start_point, end_point, keep_ratio=1.0):
     start = np.asarray(start_point, dtype=float)
     push_vector = np.asarray(end_point, dtype=float) - start
     return start + keep_ratio * push_vector
+
+
+# ===========================
+# TOOL TIP
+# ===========================
+def tip_pose_from_wrist_pose(wrist_pose):
+    """Return the tool tip pose (PyKDL.Frame) for a wrist pose (PyKDL.Frame), e.g. from setpoint_cp.
+
+    The tip has the wrist's orientation, TOOL_TIP_OFFSET_M along the wrist z axis. The result is in the
+    same frame as wrist_pose.
+    """
+    return wrist_pose * WRIST_TO_TIP
+
+
+def wrist_pose_from_tip_pose(tip_pose):
+    """Return the wrist pose (PyKDL.Frame), e.g. for move_cp, that puts the tool tip at tip_pose (PyKDL.Frame).
+
+    The inverse of tip_pose_from_wrist_pose. The result is in the same frame as tip_pose.
+    """
+    return tip_pose * WRIST_TO_TIP.Inverse()
 
 
 # ===========================

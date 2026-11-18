@@ -27,7 +27,7 @@ from tf2_ros import Buffer, TransformListener
 from crtk_msgs.srv import QueryForwardKinematics
 
 from retraction_pkg.utils import (clip_action, dvrk_arm_reference_frame, load_workspace_boundary, move_inside_polygon,
-                                  offset_plane_points, plane_axes, plane_normal, point_in_polygon, workspace_polygon)
+                                  offset_plane_points, plane_axes, plane_normal, point_in_polygon, workspace_polygon, tip_pose_from_wrist_pose, wrist_pose_from_tip_pose)
 
 
 # The table plane and workspace are defined in this frame
@@ -66,6 +66,7 @@ class RetractionExperimentsNode(Node):
 
     def __init__(self,
                  dvrk_arm_name='PSM1',
+                 control_mode='tip', # 'tip' or 'wrist'
                  robot_mode='sim',
                  push_method='PushVIBES_start_point_optimized', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
                  current_pc_topic='/tissue_pointcloud',
@@ -82,6 +83,8 @@ class RetractionExperimentsNode(Node):
         self.service_timeout_sec = service_timeout_sec
 
         self.dvrk_arm_name = dvrk_arm_name
+
+        self.control_mode = control_mode
 
         self.push_method = push_method
 
@@ -614,13 +617,13 @@ class RetractionExperimentsNode(Node):
 
         # Every push keeps the wrist orientation the arm had at the start of the experiment,
         # and the arm returns to this pose when the experiments are finished
-        original_pose = self.psm.setpoint_cp(wait_timeout=2.0)[0]
-        original_orientation = original_pose.M
-        original_position = original_pose.p
 
         self.get_logger().info(f'Robot mode: {self.robot_mode}.')
 
-        input(f'Record goal (Enter)')
+        input(f'Record goal (Enter). Orientation of robot will be kept fixed at the current orientation.')
+        original_pose = self.psm.setpoint_cp(wait_timeout=2.0)[0]
+        original_orientation = original_pose.M
+        original_position = original_pose.p
 
         if not self.snapshot_current_pc_for_goal_pc():
             self.get_logger().error('Failed to snapshot current point cloud for goal.')
@@ -666,24 +669,29 @@ class RetractionExperimentsNode(Node):
                 
                 # Subsequent pushes
                 else:
-                    wrist_p = self.psm.setpoint_cp(wait_timeout=2.0)[0].p
+                    wrist_pose = self.psm.setpoint_cp(wait_timeout=2.0)[0]
+                    wrist_p = wrist_pose.p
                     # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
                     if self.robot_mode == 'sim':
                         wrist_p = self.transform_points([wrist_p], DVRK_PSM_BASE_FRAME,
                                                       self.current_pc_snapshot.header.frame_id)[0]
-                    wrist_position = [wrist_p.x(), wrist_p.y(), wrist_p.z()]
+
+                    tip_pose = tip_pose_from_wrist_pose(wrist_pose)
+
+                    current_pose = wrist_pose if self.control_mode == 'wrist' else tip_pose
+                    current_position = [current_pose.p.x(), current_pose.p.y(), current_pose.p.z()]
 
 
                     # Method selection
                     if self.push_method == 'PushVIBES_start_point_optimized':
                         predicted_start_point, predicted_end_point, _history = self.pushvibes_deployer.predict_push_start_point_optimized(
-                            current_pc_numpy, goal_pc_numpy, wrist_position, visualize_single=False)
+                            current_pc_numpy, goal_pc_numpy, current_position, visualize_single=False)
 
-                        self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, wrist_position) * 1000:.2f} mm from the measured tool tip.')
+                        self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, current_position) * 1000:.2f} mm from the measured tool tip.')
                     
                     elif self.push_method == 'PushVIBES_start_point_conditioned':
                         predicted_start_point, predicted_end_point = self.pushvibes_deployer.predict_push_start_point_conditioned(
-                            current_pc_numpy, goal_pc_numpy, wrist_position, visualize_single=False)
+                            current_pc_numpy, goal_pc_numpy, current_position, visualize_single=False)
 
                 frame_id = self.current_pc_snapshot.header.frame_id
                 self.raw_action_marker = self.make_traj_marker(predicted_start_point, predicted_end_point, frame_id=frame_id,
@@ -717,12 +725,15 @@ class RetractionExperimentsNode(Node):
 
 
                 # chamfer_pre_push = self.get_chamfer_distances()
+
+                target_start_pose = PyKDL.Frame(original_orientation, start_p) if self.control_mode == 'wrist' else wrist_pose_from_tip_pose(PyKDL.Frame(original_orientation, start_p)) # if control mode is tip, we treat start_p as a tip pose
+                target_end_pose = PyKDL.Frame(original_orientation, end_p) if self.control_mode == 'wrist' else wrist_pose_from_tip_pose(PyKDL.Frame(original_orientation, end_p)) # if control mode is tip, we treat end_p as a tip pose
                 
                 self.get_logger().info(f'Moving to start point {list(start_p)}.')
-                self.move_cp_linear(PyKDL.Frame(original_orientation, start_p))
+                self.move_cp_linear(target_start_pose)
                 time.sleep(1.0)
                 self.get_logger().info(f'Moving to end point {list(end_p)}.')
-                self.move_cp_linear(PyKDL.Frame(original_orientation, end_p))
+                self.move_cp_linear(target_end_pose)
 
                 time.sleep(1.0) # Wait for tissue to settle
 
