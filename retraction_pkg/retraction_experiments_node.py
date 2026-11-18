@@ -130,6 +130,9 @@ class RetractionExperimentsNode(Node):
         self.show_traj_history = show_traj_history
         self.executed_traj_markers = []  # Markers of executed trajectories, only kept if show_traj_history
         self.marker_pub = self.create_publisher(MarkerArray, '/pushvibes_trajectory_marker', SNAPSHOT_QOS)
+        # The action as predicted, before clipping and workspace checks. Own topic, so it can be toggled separately
+        self.raw_action_marker = None
+        self.raw_action_marker_pub = self.create_publisher(MarkerArray, '/pushvibes_raw_action_marker', SNAPSHOT_QOS)
         self.marker_pub_rate = 5.0  # Hz
         self.marker_pub_timer = self.create_timer(1.0 / self.marker_pub_rate, self.publish_rviz_traj_marker)
 
@@ -268,11 +271,12 @@ class RetractionExperimentsNode(Node):
         self.get_logger().info('Snapshotted current point cloud as the goal point cloud.')
         return True
 
-    def set_rviz_traj_marker(self, start_point, end_point, frame_id="camera_color_optical_frame"):
-        """Set the Rviz markers for the predicted trajectory.
+    def make_traj_marker(self, start_point, end_point, frame_id="camera_color_optical_frame",
+                         ns="pushvibes_trajectory", shaft_rgb=(0.0, 1.0, 0.0)):
+        """Return the Rviz markers for a trajectory as a MarkerArray.
 
         A single ARROW marker can only have one color, so the trajectory is drawn as three
-        markers: a bright green shaft, an electric blue arrow head and a cherry red start ball.
+        markers: a shaft (bright green by default), an electric blue arrow head and a cherry red start ball.
         """
         start = [float(v) for v in start_point]
         end = [float(v) for v in end_point]
@@ -286,7 +290,7 @@ class RetractionExperimentsNode(Node):
             marker = Marker()
             marker.header.frame_id = frame_id
             marker.header.stamp = stamp
-            marker.ns = "pushvibes_trajectory"
+            marker.ns = ns
             marker.id = marker_id
             marker.type = marker_type
             marker.action = Marker.ADD
@@ -295,8 +299,8 @@ class RetractionExperimentsNode(Node):
             marker.lifetime = Duration(seconds=3.0).to_msg()  # Republished at marker_pub_rate, so they only expire once the node stops
             return marker
 
-        # Shaft: bright green line from the start point to the base of the arrow head
-        shaft = make_marker(0, Marker.LINE_STRIP, (0.0, 1.0, 0.0))
+        # Shaft: line from the start point to the base of the arrow head
+        shaft = make_marker(0, Marker.LINE_STRIP, shaft_rgb)
         shaft.scale.x = 0.0026  # Line width in meters
         shaft.points = [Point(x=start[0], y=start[1], z=start[2]),
                         Point(x=head_base[0], y=head_base[1], z=head_base[2])]
@@ -315,7 +319,7 @@ class RetractionExperimentsNode(Node):
         ball.pose.orientation.w = 1.0
         ball.scale.x = ball.scale.y = ball.scale.z = 0.0052  # Diameter in meters
 
-        self.pushvibes_traj_marker = MarkerArray(markers=[shaft, head, ball])
+        return MarkerArray(markers=[shaft, head, ball])
 
     def mark_marker_as_complete(self):
         """Change the color of the trajectory markers to a dark green, to indicate the trajectory has been executed.
@@ -323,6 +327,8 @@ class RetractionExperimentsNode(Node):
         With show_traj_history, the markers move to the history (own namespace and ids, so the next
         prediction doesn't overwrite them) and stay up for the rest of the experiment.
         """
+        self.raw_action_marker = None  # Only shown for the pending push, so it expires once the push is executed
+
         if self.pushvibes_traj_marker is not None:
             for marker in self.pushvibes_traj_marker.markers:
                 marker.color.r = 0.0
@@ -337,12 +343,15 @@ class RetractionExperimentsNode(Node):
                 self.pushvibes_traj_marker = None
 
     def publish_rviz_traj_marker(self):
-        """Publish the Rviz markers for the executed trajectories (if show_traj_history) and the predicted trajectory."""
+        """Publish the Rviz markers for the executed trajectories (if show_traj_history), the predicted trajectory,
+        and, on its own topic, the raw predicted action."""
         markers = list(self.executed_traj_markers)
         if self.pushvibes_traj_marker is not None:
             markers += self.pushvibes_traj_marker.markers
         if markers:
             self.marker_pub.publish(MarkerArray(markers=markers))
+        if self.raw_action_marker is not None:
+            self.raw_action_marker_pub.publish(self.raw_action_marker)
 
     def make_plane_marker(self, plane_points, ns, rgb, frame_id=PLANE_FRAME, size=0.6, thickness=0.001):
         """Make a Rviz marker for a plane parallel to the table: a thin square, size meters wide, centered on plane_points.
@@ -676,6 +685,10 @@ class RetractionExperimentsNode(Node):
                         predicted_start_point, predicted_end_point = self.pushvibes_deployer.predict_push_start_point_conditioned(
                             current_pc_numpy, goal_pc_numpy, wrist_position, visualize_single=False)
 
+                frame_id = self.current_pc_snapshot.header.frame_id
+                self.raw_action_marker = self.make_traj_marker(predicted_start_point, predicted_end_point, frame_id=frame_id,
+                                                               ns="pushvibes_raw_action", shaft_rgb=(0.7, 0.0, 1.0))  # Bright purple
+
                 clipped_end_point = clip_action(predicted_start_point, predicted_end_point, keep_ratio=0.25)
 
                 # Real robot only. Before the marker and the prompt below, so what's shown and confirmed is what gets executed
@@ -683,7 +696,7 @@ class RetractionExperimentsNode(Node):
                     predicted_start_point = self.keep_point_in_workspace(predicted_start_point, 'start')
                     clipped_end_point = self.keep_point_in_workspace(clipped_end_point, 'end')
 
-                self.set_rviz_traj_marker(predicted_start_point, clipped_end_point, frame_id=self.current_pc_snapshot.header.frame_id)
+                self.pushvibes_traj_marker = self.make_traj_marker(predicted_start_point, clipped_end_point, frame_id=frame_id)
 
 
                 # press enter to continue, anything else to quit
