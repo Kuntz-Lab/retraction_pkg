@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Run retraction experiments from snapshots of the live tissue and context point clouds."""
 
-import json
 import math
 import threading
 import time
@@ -25,120 +24,26 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from tf2_ros import Buffer, TransformListener
 
+from crtk_msgs.srv import QueryForwardKinematics
 
-# Define table plane in camera_color_optical_frame
+from retraction_pkg.utils import (clip_action, dvrk_arm_reference_frame, load_workspace_polygon, move_inside_polygon,
+                                  offset_plane_points, plane_axes, plane_normal, point_in_polygon)
+
+
+# The table plane and workspace are defined in this frame
 PLANE_FRAME = 'camera_color_optical_frame'
 
-PLANE_POINTS = [
-    np.array([0.021911092446555286, 0.06784100530667117, 0.18549440839995876]),
-    np.array([-0.08994168808681319, 0.05856682040941594, 0.21703163195042452]),
-    np.array([-0.03985805694134603, 0.01761314976124996, 0.3216261340978672])
+# Table plane, recorded as PSM1 joint positions (yaw, pitch, insertion, roll, wrist_pitch, wrist_yaw)
+# with the tool tip touching the table. Forward kinematics turns them into PLANE_FRAME points at startup,
+# so the plane follows whichever hand-eye calibration the dVRK is running.
+PLANE_JOINT_POSITIONS = [
+    [0.3106005589558861, -0.459975369732833, 0.2172696736946907, -3.8183545886197208, -1.0938604733427009, -0.3938675440617281],
+    [0.740048060103887, -0.26681916841528414, 0.29, -3.675438814646455, -0.5617689210364666, 0.12532527453648545],
+    [1.0601869809594264, -0.6014611555222484, 0.28665907126368567, -4.361819006437016, -0.7778424717096042, -0.05168726468651352],
 ]
 
-POINT_ON_OPERATING_SIDE_OF_PLANE = np.array([-0.04724825116424486, -0.015205646801040293, 0.20428739561993214])  # Point on the side of the plane where the robot operates (for normal direction)
-
-
-def plane_normal(plane_points, point_on_operating_side):
-    """Return the unit normal of the plane through plane_points, pointing to the side of point_on_operating_side."""
-    p0, p1, p2 = plane_points
-    normal = np.cross(p1 - p0, p2 - p0)
-    normal /= np.linalg.norm(normal)
-    if np.dot(point_on_operating_side - p0, normal) < 0:
-        normal = -normal
-    return normal
-
-
-def offset_plane_points(plane_points, point_on_operating_side, offset_mm):
-    """Return plane_points moved offset_mm along the plane normal, away from point_on_operating_side."""
-    normal = plane_normal(plane_points, point_on_operating_side)
-    return [point - offset_mm / 1000.0 * normal for point in plane_points]
-
-
-def plane_axes(plane_points, point_on_operating_side):
-    """Return unit (x, y, z) axes of a right-handed frame on the plane, with z the plane normal."""
-    p0, p1, _ = plane_points
-    x_axis = (p1 - p0) / np.linalg.norm(p1 - p0)
-    z_axis = plane_normal(plane_points, point_on_operating_side)
-    return x_axis, np.cross(z_axis, x_axis), z_axis
-
-
-def load_workspace_polygon(path, origin, x_axis, y_axis):
-    """Load a trace from workspace_recorder_node as an Nx2 polygon, in meters along x_axis and y_axis from origin.
-
-    The polygon keeps the recorded order, so it follows the trace even where the trace curves inward.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f'No workspace boundary at {path}. Trace the workspace edge with workspace_recorder_node first.')
-    with open(path) as f:
-        boundary = json.load(f)
-    if boundary['frame_id'] != PLANE_FRAME:
-        raise ValueError(f"{path} is in frame {boundary['frame_id']!r}, expected {PLANE_FRAME!r}.")
-
-    points = np.array(boundary['points']).reshape(-1, 3)
-    polygon = (points - origin) @ np.stack([x_axis, y_axis], axis=1)
-
-    # The arm sits still at times during a trace, and repeated points would make zero length edges
-    keep = np.linalg.norm(polygon - np.roll(polygon, 1, axis=0), axis=1) > 1e-6
-    polygon = polygon[keep]
-    if len(polygon) < 3:
-        raise ValueError(f'{path} has {len(polygon)} distinct points, a polygon needs at least 3.')
-    return polygon
-
-
-def point_in_polygon(point, polygon):
-    """Return True if the 2D point is inside polygon, by winding number so a trace that overlaps its start stays filled."""
-    x, y = point
-    starts = polygon
-    ends = np.roll(polygon, -1, axis=0)
-    edges = ends - starts
-    side = edges[:, 0] * (y - starts[:, 1]) - edges[:, 1] * (x - starts[:, 0])  # Positive if point is left of the edge
-    crosses_up = (starts[:, 1] <= y) & (ends[:, 1] > y) & (side > 0)
-    crosses_down = (starts[:, 1] > y) & (ends[:, 1] <= y) & (side < 0)
-    return bool(np.sum(crosses_up) != np.sum(crosses_down))
-
-
-def closest_point_on_polygon(point, polygon):
-    """Return the point on the polygon's outline closest to the 2D point, and the index of its edge."""
-    edges = np.roll(polygon, -1, axis=0) - polygon
-    t = np.clip(np.sum((point - polygon) * edges, axis=1) / np.sum(edges * edges, axis=1), 0.0, 1.0)
-    closest = polygon + t[:, np.newaxis] * edges
-    index = int(np.argmin(np.linalg.norm(point - closest, axis=1)))
-    return closest[index], index
-
-
-def move_inside_polygon(point, polygon, clearance, tolerance=1e-6, max_iterations=2000):
-    """Return the 2D point moved the shortest way to be inside polygon, at least clearance from its outline.
-
-    Each step sets the distance to the nearest edge to clearance. Near a corner that can put the point too
-    close to the other edge, so this repeats until every edge is clear.
-    """
-    edges = np.roll(polygon, -1, axis=0) - polygon
-    counterclockwise = np.sum(polygon[:, 0] * np.roll(polygon, -1, axis=0)[:, 1]
-                              - np.roll(polygon, -1, axis=0)[:, 0] * polygon[:, 1]) > 0
-
-    for _ in range(max_iterations):
-        closest, edge_index = closest_point_on_polygon(point, polygon)
-        offset = point - closest
-        distance = np.linalg.norm(offset)
-        inside = point_in_polygon(point, polygon)
-        if inside and distance >= clearance - tolerance:
-            return point
-
-        if distance > 1e-9:
-            inward = offset / distance if inside else -offset / distance
-        else:  # On the outline, where offset is only rounding error, so use the normal of the edge instead
-            edge = edges[edge_index] / np.linalg.norm(edges[edge_index])
-            inward = np.array([-edge[1], edge[0]]) if counterclockwise else np.array([edge[1], -edge[0]])
-        point = closest + clearance * inward
-
-    raise ValueError(f'No point {clearance * 1000:.1f} mm inside the workspace polygon was found near the input.')
-
-
-def clip_action(start_point, end_point, keep_ratio=1.0):
-    """Return the end point moved along the push so the push keeps keep_ratio of its original length."""
-    start = np.asarray(start_point, dtype=float)
-    push_vector = np.asarray(end_point, dtype=float) - start
-    return start + keep_ratio * push_vector
+# Joint positions of a point on the side of the plane where the robot operates (for normal direction)
+POINT_ON_OPERATING_SIDE_JOINT_POSITIONS = [1.0192463917451022, -0.4495334897370609, 0.19171532898725516, -4.282612155780166, -0.6608680916167913, -0.1550565519496429]
 
 
 PUSHVIBES_ROOT = os.path.expanduser('~/retraction_ws/src/PushVIBES')
@@ -228,15 +133,19 @@ class RetractionExperimentsNode(Node):
         self.marker_pub_rate = 5.0  # Hz
         self.marker_pub_timer = self.create_timer(1.0 / self.marker_pub_rate, self.publish_rviz_traj_marker)
 
-        # PLANE_POINTS sit a fixed offset above the table, so move the plane down onto it
-        self.plane_points = offset_plane_points(PLANE_POINTS, POINT_ON_OPERATING_SIDE_OF_PLANE, plane_offset_mm)
+        # Table plane in PLANE_FRAME, from the recorded joint positions and the hand-eye calibration the dVRK is running
+        *recorded_plane_points, self.point_on_operating_side = self.joint_positions_to_plane_frame(
+            PLANE_JOINT_POSITIONS + [POINT_ON_OPERATING_SIDE_JOINT_POSITIONS])
+
+        # The recorded plane points sit a fixed offset above the table, so move the plane down onto it
+        self.plane_points = offset_plane_points(recorded_plane_points, self.point_on_operating_side, plane_offset_mm)
 
         # The workspace is the traced polygon, extended normal to the table from the table up to workspace_height
-        self.table_axes = plane_axes(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE)
+        self.table_axes = plane_axes(self.plane_points, self.point_on_operating_side)
         self.workspace_height = workspace_height_mm / 1000.0
         self.workspace_polygon = load_workspace_polygon(os.path.expanduser(workspace_boundary_path),
-                                                        self.plane_points[0], *self.table_axes[:2])
-        top_plane_points = offset_plane_points(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE, -workspace_height_mm)
+                                                        self.plane_points[0], *self.table_axes[:2], PLANE_FRAME)
+        top_plane_points = offset_plane_points(self.plane_points, self.point_on_operating_side, -workspace_height_mm)
 
         # Rviz markers for the workspace, each on its own topic so they can be toggled separately
         self.workspace_marker_pubs = [
@@ -501,7 +410,7 @@ class RetractionExperimentsNode(Node):
         Returns (True, point) if the point is on or above the plane. Otherwise returns
         (False, closest_point), where closest_point is the nearest point clearance_mm above the plane.
         """
-        normal = plane_normal(self.plane_points, POINT_ON_OPERATING_SIDE_OF_PLANE)
+        normal = plane_normal(self.plane_points, self.point_on_operating_side)
         height = np.dot(point - self.plane_points[0], normal)  # Signed distance, negative below the plane
         if height >= 0:
             return True, point
@@ -585,6 +494,50 @@ class RetractionExperimentsNode(Node):
         T = PyKDL.Frame(PyKDL.Rotation.Quaternion(tf.rotation.x, tf.rotation.y, tf.rotation.z, tf.rotation.w),
                         PyKDL.Vector(tf.translation.x, tf.translation.y, tf.translation.z))
         return [T * v for v in vectors]
+
+    def joint_positions_to_plane_frame(self, joint_positions, timeout_sec=5.0):
+        """Return the tool tip position for each list of arm joint positions, as numpy arrays in PLANE_FRAME.
+
+        Uses the dVRK's forward kinematics service, which reports poses in the same frame as setpoint_cp:
+        PLANE_FRAME on the real robot (through the base_frame hand-eye calibration in the console config),
+        and DVRK_PSM_BASE_FRAME in sim, where the points are then transformed to PLANE_FRAME with TF.
+
+        Called from __init__, before the node's executor spins, so it spins the node itself while waiting.
+        """
+        if self.robot_mode == 'real':
+            reference_frame = dvrk_arm_reference_frame(self.dvrk_arm_name)
+            if reference_frame != PLANE_FRAME:
+                raise RuntimeError(f'The dVRK reports {self.dvrk_arm_name} poses in {reference_frame!r}, expected {PLANE_FRAME!r}. '
+                                   'Launch dvrk_system with a hand-eye calibrated console config.')
+
+        service_name = f'/{self.dvrk_arm_name}/forward_kinematics'
+        client = self.create_client(QueryForwardKinematics, service_name)
+        try:
+            if not client.wait_for_service(timeout_sec=timeout_sec):
+                raise RuntimeError(f'{service_name} is not available. Is dvrk_system running?')
+            points = []
+            for jp in joint_positions:
+                future = client.call_async(QueryForwardKinematics.Request(jp=[float(q) for q in jp]))
+                rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+                response = future.result()
+                if response is None:
+                    raise RuntimeError(f'{service_name} did not respond within {timeout_sec} s.')
+                if not response.result:
+                    raise RuntimeError(f'{service_name} failed for {jp}: {response.message}')
+                p = response.cp.position
+                points.append(PyKDL.Vector(p.x, p.y, p.z))
+        finally:
+            self.destroy_client(client)
+
+        if self.robot_mode == 'sim':
+            # Wait for TF to have the transform, since the listener only receives it while the node spins
+            future = self.tf_buffer.wait_for_transform_async(PLANE_FRAME, DVRK_PSM_BASE_FRAME, Time())
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+            if not future.done():
+                raise RuntimeError(f'No TF transform from {DVRK_PSM_BASE_FRAME} to {PLANE_FRAME} within {timeout_sec} s.')
+            points = self.transform_points(points, DVRK_PSM_BASE_FRAME, PLANE_FRAME)
+
+        return [np.array([v.x(), v.y(), v.z()]) for v in points]
 
     
     # def get_chamfer_distances(which_camera):
@@ -809,7 +762,7 @@ def main(args=None):
     node = RetractionExperimentsNode(robot_mode='real', 
                                      push_method='PushVIBES_start_point_conditioned', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
                                      show_traj_history=True,
-                                     plane_offset_mm=7.0, #7.0  # How far the table sits below PLANE_POINTS, along the plane normal
+                                     plane_offset_mm=7.0, #7.0  # How far the table sits below the recorded plane points, along the plane normal
                                      workspace_height_mm=110.0)  # How far the top of the workspace sits above the table
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
