@@ -26,8 +26,8 @@ from tf2_ros import Buffer, TransformListener
 
 from crtk_msgs.srv import QueryForwardKinematics
 
-from retraction_pkg.utils import (clip_action, dvrk_arm_reference_frame, load_workspace_polygon, move_inside_polygon,
-                                  offset_plane_points, plane_axes, plane_normal, point_in_polygon)
+from retraction_pkg.utils import (clip_action, dvrk_arm_reference_frame, load_workspace_boundary, move_inside_polygon,
+                                  offset_plane_points, plane_axes, plane_normal, point_in_polygon, workspace_polygon)
 
 
 # The table plane and workspace are defined in this frame
@@ -143,8 +143,8 @@ class RetractionExperimentsNode(Node):
         # The workspace is the traced polygon, extended normal to the table from the table up to workspace_height
         self.table_axes = plane_axes(self.plane_points, self.point_on_operating_side)
         self.workspace_height = workspace_height_mm / 1000.0
-        self.workspace_polygon = load_workspace_polygon(os.path.expanduser(workspace_boundary_path),
-                                                        self.plane_points[0], *self.table_axes[:2], PLANE_FRAME)
+        self.workspace_polygon = workspace_polygon(self.load_workspace_trace(os.path.expanduser(workspace_boundary_path)),
+                                                   self.plane_points[0], *self.table_axes[:2])
         top_plane_points = offset_plane_points(self.plane_points, self.point_on_operating_side, -workspace_height_mm)
 
         # Rviz markers for the workspace, each on its own topic so they can be toggled separately
@@ -416,7 +416,7 @@ class RetractionExperimentsNode(Node):
             return True, point
         return False, point + (clearance_mm / 1000.0 - height) * normal
 
-    def check_point_in_workspace(self, point, clearance_mm=4.0):
+    def check_point_in_workspace(self, point, clearance_mm=8.0):
         """Check a single xyz numpy array, in PLANE_FRAME, against the table, the walls and the top of the workspace.
 
         Returns (True, point) if the point is inside or on the workspace. Otherwise returns (False, closest_point),
@@ -538,6 +538,26 @@ class RetractionExperimentsNode(Node):
             points = self.transform_points(points, DVRK_PSM_BASE_FRAME, PLANE_FRAME)
 
         return [np.array([v.x(), v.y(), v.z()]) for v in points]
+
+    def load_workspace_trace(self, path):
+        """Return the workspace_recorder_node trace at path as Nx3 points in PLANE_FRAME.
+
+        A joint mode trace goes through forward kinematics, so it follows the hand-eye calibration the dVRK
+        is running. A cartesian mode trace is used as recorded, so it's only right for the calibration it was
+        recorded with.
+        """
+        boundary = load_workspace_boundary(path)
+        if 'joint_positions' in boundary:
+            if boundary['arm'] != self.dvrk_arm_name:
+                raise ValueError(f"{path} was recorded with {boundary['arm']}, but this node drives {self.dvrk_arm_name}.")
+            points = self.joint_positions_to_plane_frame(boundary['joint_positions'])
+            self.get_logger().info(f'Workspace: {len(points)} recorded joint positions from {path}, converted to {PLANE_FRAME}.')
+            return np.array(points)
+
+        if boundary['frame_id'] != PLANE_FRAME:
+            raise ValueError(f"{path} is in frame {boundary['frame_id']!r}, expected {PLANE_FRAME!r}.")
+        self.get_logger().warn(f'Workspace: {path} is a cartesian trace, so it was not updated for the current hand-eye calibration.')
+        return np.array(boundary['points'])
 
     
     # def get_chamfer_distances(which_camera):
@@ -762,7 +782,7 @@ def main(args=None):
     node = RetractionExperimentsNode(robot_mode='real', 
                                      push_method='PushVIBES_start_point_conditioned', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
                                      show_traj_history=True,
-                                     plane_offset_mm=7.0, #7.0  # How far the table sits below the recorded plane points, along the plane normal
+                                     plane_offset_mm=6.0, #7.0  # How far the table sits below the recorded plane points, along the plane normal
                                      workspace_height_mm=110.0)  # How far the top of the workspace sits above the table
 
     # Spin callbacks (subscribers, service responses) on a background thread so the

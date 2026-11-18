@@ -36,27 +36,31 @@ def plane_axes(plane_points, point_on_operating_side):
 # ===========================
 # WORKSPACE POLYGON
 # ===========================
-def load_workspace_polygon(path, origin, x_axis, y_axis, frame_id):
-    """Load a trace from workspace_recorder_node as an Nx2 polygon, in meters along x_axis and y_axis from origin.
+def load_workspace_boundary(path):
+    """Load a trace from workspace_recorder_node.
 
-    The trace must be recorded in frame_id. The polygon keeps the recorded order, so it follows the
-    trace even where the trace curves inward.
+    Returns its dict: {'arm', 'joint_names', 'joint_positions'} from joint mode, or {'frame_id', 'points'}
+    from cartesian mode.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f'No workspace boundary at {path}. Trace the workspace edge with workspace_recorder_node first.')
     with open(path) as f:
-        boundary = json.load(f)
-    if boundary['frame_id'] != frame_id:
-        raise ValueError(f"{path} is in frame {boundary['frame_id']!r}, expected {frame_id!r}.")
+        return json.load(f)
 
-    points = np.array(boundary['points']).reshape(-1, 3)
+
+def workspace_polygon(points, origin, x_axis, y_axis):
+    """Return the traced Nx3 points as an Nx2 polygon, in meters along x_axis and y_axis from origin.
+
+    The polygon keeps the recorded order, so it follows the trace even where the trace curves inward.
+    """
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
     polygon = (points - origin) @ np.stack([x_axis, y_axis], axis=1)
 
     # The arm sits still at times during a trace, and repeated points would make zero length edges
     keep = np.linalg.norm(polygon - np.roll(polygon, 1, axis=0), axis=1) > 1e-6
     polygon = polygon[keep]
     if len(polygon) < 3:
-        raise ValueError(f'{path} has {len(polygon)} distinct points, a polygon needs at least 3.')
+        raise ValueError(f'The workspace trace has {len(polygon)} distinct points, a polygon needs at least 3.')
     return polygon
 
 
