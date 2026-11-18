@@ -689,7 +689,7 @@ class RetractionExperimentsNode(Node):
                 self.raw_action_marker = self.make_traj_marker(predicted_start_point, predicted_end_point, frame_id=frame_id,
                                                                ns="pushvibes_raw_action", shaft_rgb=(0.7, 0.0, 1.0))  # Bright purple
 
-                clipped_end_point = clip_action(predicted_start_point, predicted_end_point, keep_ratio=0.25)
+                clipped_end_point = clip_action(predicted_start_point, predicted_end_point, keep_ratio=0.50)
 
                 # Real robot only. Before the marker and the prompt below, so what's shown and confirmed is what gets executed
                 if self.robot_mode == 'real':
