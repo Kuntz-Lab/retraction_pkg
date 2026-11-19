@@ -67,8 +67,8 @@ class RetractionExperimentsNode(Node):
     def __init__(self,
                  dvrk_arm_name='PSM1',
                  control_mode='tip', # 'tip' or 'wrist'
-                 robot_mode='sim',
-                 push_method='PushVIBES_start_point_optimized', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
+                 robot_mode='real',
+                 push_method='', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushDeterministic, Heuristic}
                  current_pc_topic='/tissue_pointcloud',
                  context_pc_topic='/context_pointcloud',
                  goal_service_name='/generate_goal_pointcloud',
@@ -167,9 +167,24 @@ class RetractionExperimentsNode(Node):
 
         ###
 
-        self.pushvibes_deployer = DeployPushVIBES(weights_path=os.path.expanduser("~/model_weights/PushVIBES/VIB/latest_model_weights.pt"),
-                                                  basis_path="./bps/bps_basis_r1.0_n128.npy",
-                                                  start_point_conditioned_weights_path=os.path.expanduser("~/model_weights/PushVIBES/VIB_start_point_conditioned/latest_model_weights.pt"))
+        # Only the selected method's deployer is loaded
+        if self.push_method in ('PushVIBES_start_point_optimized', 'PushVIBES_start_point_conditioned'):
+            self.deployer = DeployPushVIBES(weights_path=os.path.expanduser("~/model_weights/PushVIBES/VIB/latest_model_weights.pt"),
+                                            basis_path="./bps/bps_basis_r1.0_n128.npy",
+                                            start_point_conditioned_weights_path=os.path.expanduser("~/model_weights/PushVIBES/VIB_start_point_conditioned/latest_model_weights.pt"))
+        elif self.push_method == 'PushDeterministic':
+            # TODO: paste the weights paths. Blank on purpose, so the node fails until they're set
+            pushdeterministic_weights_path = ""  # PushDeterministic, for the first push
+            pushdeterministic_start_point_conditioned_weights_path = ""  # PushDeterministic_start_point_conditioned, for later pushes
+            if not pushdeterministic_weights_path or not pushdeterministic_start_point_conditioned_weights_path:
+                raise ValueError('PushDeterministic weights paths are blank; paste them in RetractionExperimentsNode.__init__.')
+            self.deployer = DeployPushDeterministic(weights_path=os.path.expanduser(pushdeterministic_weights_path),
+                                                    basis_path="./bps/bps_basis_r1.0_n128.npy",
+                                                    start_point_conditioned_weights_path=os.path.expanduser(pushdeterministic_start_point_conditioned_weights_path))
+        elif self.push_method == 'Heuristic':
+            self.deployer = DeployPushHeuristic()
+        else:
+            raise ValueError(f'Unknown push_method {self.push_method!r}')
 
         self.get_logger().info('Retraction experiments node initialized.')
 
@@ -662,13 +677,17 @@ class RetractionExperimentsNode(Node):
 
                     # Method selection
                     if self.push_method == 'PushVIBES_start_point_optimized' or self.push_method == 'PushVIBES_start_point_conditioned':
-                        predicted_start_point, predicted_end_point, _preds = self.pushvibes_deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+                        predicted_start_point, predicted_end_point, _preds = self.deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
+
+                    elif self.push_method in ('PushDeterministic', 'Heuristic'):
+                        predicted_start_point, predicted_end_point = self.deployer.predict_push(current_pc_numpy, goal_pc_numpy, visualize_single=False)
                 
                 
                 
                 
                 # Subsequent pushes
                 else:
+                    # Get the current robot manipulation point
                     wrist_pose = self.psm.setpoint_cp(wait_timeout=2.0)[0]
                     wrist_p = wrist_pose.p
                     # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
@@ -684,13 +703,14 @@ class RetractionExperimentsNode(Node):
 
                     # Method selection
                     if self.push_method == 'PushVIBES_start_point_optimized':
-                        predicted_start_point, predicted_end_point, _history = self.pushvibes_deployer.predict_push_start_point_optimized(
+                        predicted_start_point, predicted_end_point, _history = self.deployer.predict_push_start_point_optimized(
                             current_pc_numpy, goal_pc_numpy, current_position, visualize_single=False)
 
                         self.get_logger().info(f'Start point optimized: {math.dist(predicted_start_point, current_position) * 1000:.2f} mm from the measured tool tip.')
                     
-                    elif self.push_method == 'PushVIBES_start_point_conditioned':
-                        predicted_start_point, predicted_end_point = self.pushvibes_deployer.predict_push_start_point_conditioned(
+                    # Same call for all three: the deployer predicts the end point for a push from current_position
+                    elif self.push_method in ('PushVIBES_start_point_conditioned', 'PushDeterministic', 'Heuristic'):
+                        predicted_start_point, predicted_end_point = self.deployer.predict_push_start_point_conditioned(
                             current_pc_numpy, goal_pc_numpy, current_position, visualize_single=False)
 
                 frame_id = self.current_pc_snapshot.header.frame_id
@@ -804,7 +824,7 @@ class RetractionExperimentsNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RetractionExperimentsNode(robot_mode='real', 
-                                     push_method='PushVIBES_start_point_conditioned', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushVIBES_deterministic, heuristic}
+                                     push_method='PushVIBES_start_point_conditioned', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushDeterministic, Heuristic}
                                      show_traj_history=True,
                                      plane_offset_mm=6.0, #7.0  # How far the table sits below the recorded plane points, along the plane normal
                                      workspace_height_mm=110.0)  # How far the top of the workspace sits above the table
