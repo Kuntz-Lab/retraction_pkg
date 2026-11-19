@@ -614,23 +614,7 @@ class RetractionExperimentsNode(Node):
         if not self.psm.enable(10):
             sys.exit('failed to enable within 10 seconds')
 
-        # if input(f'Ensure the {self.dvrk_arm_name} gripper is closed and the wrist is oriented straight down. Press Enter to continue (q to quit): ').strip().lower() == 'q':
-        #     return
-        
-        # dvrk_wrist_orientation = self.psm.measured_cp(wait_timeout=2.0)[0].M # type is PyKDL.Rotation
-
-        # if input(f'Ensure the {self.dvrk_arm_name} end effector has 5cm of space around it for testing. Press Enter to continue (q to quit): ').strip().lower() == 'q':
-        #     return
-
-
-        # self.get_logger().info(f'Moving {self.dvrk_arm_name} in small test path.')
-
-        # # Move the arm 1 cm back and forth in x to verify the arm can move
-        # for dx in [-0.01, 0.01, 0.01, -0.01]:
-        #     goal = PyKDL.Frame(dvrk_wrist_orientation, self.psm.measured_cp(wait_timeout=2.0)[0].p + PyKDL.Vector(dx, 0.0, 0.0))
-        #     self.move_cp_linear(goal, step_size=0.0005, speed=0.005)
-
-        # Every push keeps the wrist orientation the arm had at the start of the experiment,
+        # Every push keeps the wrist orientation the arm had when recording the goal,
         # and the arm returns to this pose when the experiments are finished
 
         self.get_logger().info(f'Robot mode: {self.robot_mode}.')
