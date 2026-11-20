@@ -2,10 +2,15 @@
 
 import json
 import os
+import time
 
 import numpy as np
 import PyKDL
+from realsense2_camera_msgs.srv import DeviceInfo
 
+
+# RealSense serial numbers of the two camera placements
+CAMERA_SERIALS = {'261122275998': 'front', '261122274487': 'side'}
 
 # Measured distance from the wrist (the wrist yaw axis, where setpoint_cp sits) to the tool tip, along the wrist z axis
 TOOL_TIP_OFFSET_M = 0.028
@@ -214,3 +219,43 @@ def dvrk_is_front_camera_calibrated():
     if has_side == has_front:
         raise ValueError(f"dvrk_system config {path} must have exactly one of 'side' or 'front' in its name.")
     return has_front
+
+
+def running_camera_name(node, timeout_sec=5.0, discovery_sec=2.0):
+    """Return 'front' or 'side' for the one running RealSense camera, read from its device_info service.
+
+    Listens for at least discovery_sec so that a second running camera is found too, and raises if there is not
+    exactly one.
+    """
+    start = time.monotonic()
+    while True:
+        services = sorted(name for name, types in node.get_service_names_and_types()
+                          if 'realsense2_camera_msgs/srv/DeviceInfo' in types)
+        elapsed = time.monotonic() - start
+        if (services and elapsed > discovery_sec) or elapsed > timeout_sec:
+            break
+        time.sleep(0.1)  # Wait for discovery to find every running camera
+    if len(services) != 1:
+        raise RuntimeError(f'Expected exactly one RealSense camera, found {len(services)}: {services}')
+    client = node.create_client(DeviceInfo, services[0])
+    try:
+        if not client.wait_for_service(timeout_sec=timeout_sec):
+            raise RuntimeError(f'{services[0]} is not available.')
+        response = client.call(DeviceInfo.Request(), timeout_sec=timeout_sec)
+    finally:
+        node.destroy_client(client)
+    if response is None:
+        raise RuntimeError(f'{services[0]} did not respond.')
+    if response.serial_number not in CAMERA_SERIALS:
+        raise RuntimeError(f'Unknown RealSense serial number {response.serial_number}.')
+    return CAMERA_SERIALS[response.serial_number]
+
+
+def check_camera_matches_dvrk(node):
+    """Raise RuntimeError unless the running camera is the one the running dvrk_system config is calibrated to."""
+    camera = running_camera_name(node)
+    dvrk_camera = 'front' if dvrk_is_front_camera_calibrated() else 'side'
+    if camera != dvrk_camera:
+        raise RuntimeError(f'The {camera} camera is running, but the dvrk_system config ({find_dvrk_console_file()}) '
+                           f'is calibrated to the {dvrk_camera} camera.')
+    node.get_logger().info(f'The {camera} camera matches the dvrk_system config.')

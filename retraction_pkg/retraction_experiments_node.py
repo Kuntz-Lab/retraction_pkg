@@ -26,7 +26,7 @@ from tf2_ros import Buffer, TransformListener
 
 from crtk_msgs.srv import QueryForwardKinematics
 
-from retraction_pkg.utils import (clip_action, dvrk_arm_reference_frame, load_workspace_boundary, move_inside_polygon,
+from retraction_pkg.utils import (check_camera_matches_dvrk, clip_action, dvrk_arm_reference_frame, load_workspace_boundary, move_inside_polygon,
                                   offset_plane_points, plane_axes, plane_normal, point_in_polygon, workspace_polygon, tip_pose_from_wrist_pose, wrist_pose_from_tip_pose)
 
 
@@ -173,14 +173,9 @@ class RetractionExperimentsNode(Node):
                                             basis_path="./bps/bps_basis_r1.0_n128.npy",
                                             start_point_conditioned_weights_path=os.path.expanduser("~/model_weights/PushVIBES/VIB_start_point_conditioned/latest_model_weights.pt"))
         elif self.push_method == 'PushDeterministic':
-            # TODO: paste the weights paths. Blank on purpose, so the node fails until they're set
-            pushdeterministic_weights_path = ""  # PushDeterministic, for the first push
-            pushdeterministic_start_point_conditioned_weights_path = ""  # PushDeterministic_start_point_conditioned, for later pushes
-            if not pushdeterministic_weights_path or not pushdeterministic_start_point_conditioned_weights_path:
-                raise ValueError('PushDeterministic weights paths are blank; paste them in RetractionExperimentsNode.__init__.')
-            self.deployer = DeployPushDeterministic(weights_path=os.path.expanduser(pushdeterministic_weights_path),
+            self.deployer = DeployPushDeterministic(weights_path=os.path.expanduser('~/model_weights/PushVIBES/deterministic/latest_model_weights.pt'),
                                                     basis_path="./bps/bps_basis_r1.0_n128.npy",
-                                                    start_point_conditioned_weights_path=os.path.expanduser(pushdeterministic_start_point_conditioned_weights_path))
+                                                    start_point_conditioned_weights_path=os.path.expanduser('~/model_weights/PushVIBES/deterministic_start_point_conditioned/latest_model_weights.pt'))
         elif self.push_method == 'Heuristic':
             self.deployer = DeployPushHeuristic()
         else:
@@ -431,7 +426,7 @@ class RetractionExperimentsNode(Node):
     # ===========================
     # WORKSPACE CHECK
     # ===========================
-    def check_point_above_plane(self, point, clearance_mm=4.0):
+    def check_point_above_plane(self, point, clearance_mm=8.0):
         """Check a single xyz numpy array, in PLANE_FRAME, against the table plane.
 
         Returns (True, point) if the point is on or above the plane. Otherwise returns
@@ -802,15 +797,48 @@ class RetractionExperimentsNode(Node):
 
 
 
+PUSH_METHODS = [
+    'PushVIBES_start_point_optimized',
+    'PushVIBES_start_point_conditioned',
+    'PushDeterministic',
+    'Heuristic',
+]
+
+
+def select_push_method(default=PUSH_METHODS[0]):
+    """Numbered terminal menu for choosing the push method. Enter picks the default."""
+    default_idx = PUSH_METHODS.index(default) + 1
+    print('\nSelect push method:')
+    for i, method in enumerate(PUSH_METHODS, start=1):
+        print(f'  [{i}] {method}{"  (default)" if i == default_idx else ""}')
+    while True:
+        choice = input(f'Enter 1-{len(PUSH_METHODS)} [{default_idx}]: ').strip()
+        if choice == '':
+            selected = default
+            break
+        if choice.isdigit() and 1 <= int(choice) <= len(PUSH_METHODS):
+            selected = PUSH_METHODS[int(choice) - 1]
+            break
+        print(f'Invalid choice {choice!r}.')
+    print(f'Using push method: {selected}\n')
+    return selected
+
+
 # ===========================
 # MAIN
 # ===========================
 def main(args=None):
+    try:
+        push_method = select_push_method()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+
     rclpy.init(args=args)
-    node = RetractionExperimentsNode(robot_mode='real', 
-                                     push_method='PushVIBES_start_point_conditioned', # ~ {PushVIBES_start_point_optimized, PushVIBES_start_point_conditioned, PushDeterministic, Heuristic}
+    node = RetractionExperimentsNode(robot_mode='real',
+                                     push_method=push_method,
                                      show_traj_history=True,
-                                     plane_offset_mm=6.0, #7.0  # How far the table sits below the recorded plane points, along the plane normal
+                                     plane_offset_mm=10.0, #7.0  # How far the table sits below the recorded plane points, along the plane normal
                                      workspace_height_mm=110.0)  # How far the top of the workspace sits above the table
 
     # Spin callbacks (subscribers, service responses) on a background thread so the
@@ -822,6 +850,7 @@ def main(args=None):
 
     try:
         node.ral.check_connections()
+        check_camera_matches_dvrk(node)
         node.run_experiment()
     except (KeyboardInterrupt, EOFError, ExternalShutdownException):
         pass
