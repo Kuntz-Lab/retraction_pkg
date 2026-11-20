@@ -26,7 +26,7 @@ from tf2_ros import Buffer, TransformListener
 
 from crtk_msgs.srv import QueryForwardKinematics
 
-from retraction_pkg.utils import (check_camera_matches_dvrk, clip_action, dvrk_arm_reference_frame, load_workspace_boundary, move_inside_polygon,
+from retraction_pkg.utils import (check_camera_matches_dvrk, clip_action, get_chamfer_distances, dvrk_arm_reference_frame, load_workspace_boundary, move_inside_polygon,
                                   offset_plane_points, plane_axes, plane_normal, point_in_polygon, workspace_polygon, tip_pose_from_wrist_pose, wrist_pose_from_tip_pose)
 
 
@@ -87,6 +87,8 @@ class RetractionExperimentsNode(Node):
         self.control_mode = control_mode
 
         self.push_method = push_method
+
+        self.clip_keep_ratio = 0.50  # How much of the predicted push to keep, as a fraction of the distance from start to end
 
         # 'real': the robot takes commands in the point cloud (camera) frame, so predicted points are sent as is.
         # 'sim': the robot takes commands in DVRK_PSM_BASE_FRAME, so predicted points are transformed there with TF first.
@@ -284,6 +286,20 @@ class RetractionExperimentsNode(Node):
         self.get_logger().info('Snapshotted current point cloud as the goal point cloud.')
         return True
 
+    def get_current_pc_numpy(self, max_age_sec=1.0):
+        """Return the latest current (tissue) cloud as an Nx3 numpy array.
+
+        Raises RuntimeError if no cloud has been received yet, or if the latest one is older than max_age_sec.
+        """
+        with self._lock:
+            msg = self._latest_current_pc
+        if msg is None:
+            raise RuntimeError('No current point cloud received yet.')
+        age_sec = (self.get_clock().now() - Time.from_msg(msg.header.stamp)).nanoseconds / 1e9
+        if age_sec > max_age_sec:
+            raise RuntimeError(f'Latest current point cloud is {age_sec:.2f} s old (max {max_age_sec} s).')
+        return point_cloud2.read_points_numpy(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+
     def make_traj_marker(self, start_point, end_point, frame_id="camera_color_optical_frame",
                          ns="pushvibes_trajectory", shaft_rgb=(0.0, 1.0, 0.0)):
         """Return the Rviz markers for a trajectory as a MarkerArray.
@@ -438,12 +454,14 @@ class RetractionExperimentsNode(Node):
             return True, point
         return False, point + (clearance_mm / 1000.0 - height) * normal
 
-    def check_point_in_workspace(self, point, clearance_mm=8.0):
-        """Check a single xyz numpy array, in PLANE_FRAME, against the table, the walls and the top of the workspace.
+    def check_point_in_workspace(self, point, name, clearance_mm=8.0):
+        """Check point, an xyz in PLANE_FRAME, against the table, the walls and the top of the workspace.
 
         Returns (True, point) if the point is inside or on the workspace. Otherwise returns (False, closest_point),
-        where closest_point is the nearest point at least clearance_mm from the table, the walls and the top.
+        where closest_point is the nearest point at least clearance_mm from the table, the walls and the top, and
+        warns with name.
         """
+        point = np.asarray(point, dtype=float)
         clearance = clearance_mm / 1000.0
         origin = self.plane_points[0]
         x_axis, y_axis, z_axis = self.table_axes
@@ -456,16 +474,10 @@ class RetractionExperimentsNode(Node):
 
         in_plane = move_inside_polygon(in_plane, self.workspace_polygon, clearance)
         height = np.clip(height, clearance, self.workspace_height - clearance)
-        return False, origin + in_plane[0] * x_axis + in_plane[1] * y_axis + height * z_axis
-
-    def keep_point_in_workspace(self, point, name):
-        """Return point as a numpy array, moved into the workspace if it's outside, with a warning naming the point."""
-        point = np.asarray(point, dtype=float)
-        safe, checked_point = self.check_point_in_workspace(point)
-        if not safe:
-            self.get_logger().warn(f'Predicted {name} point is outside the workspace; moved it '
-                                   f'{np.linalg.norm(checked_point - point) * 1000:.1f} mm to {checked_point.tolist()}.')
-        return checked_point
+        moved_point = origin + in_plane[0] * x_axis + in_plane[1] * y_axis + height * z_axis
+        self.get_logger().warn(f'Predicted {name} point is outside the workspace; moved it '
+                               f'{np.linalg.norm(moved_point - point) * 1000:.1f} mm to {moved_point.tolist()}.')
+        return False, moved_point
 
     # ===========================
     # DVRK MOTION
@@ -581,24 +593,6 @@ class RetractionExperimentsNode(Node):
         self.get_logger().warn(f'Workspace: {path} is a cartesian trace, so it was not updated for the current hand-eye calibration.')
         return np.array(boundary['points'])
 
-    
-    # def get_chamfer_distances(which_camera):
-
-
-
-    #     chamfer_distances = {
-    #         "camera": ,
-    #         "avg_chamfer_dist_current_to_goal": ,
-    #         "avg_chamfer_dist_goal_to_current": ,
-    #         "avg_chamfer_dist_bidirectional": ,
-    #     }
-
-       
-        
-    #     return chamfer_distances
-
-        
-
     # ===========================
     # EXPERIMENT LOOP
     # ===========================
@@ -651,6 +645,19 @@ class RetractionExperimentsNode(Node):
                     skip_nans=True
                 )
 
+                # Get the current robot manipulation point
+                wrist_pose = self.psm.setpoint_cp(wait_timeout=2.0)[0]
+                wrist_p = wrist_pose.p
+                # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
+                if self.robot_mode == 'sim':
+                    wrist_p = self.transform_points([wrist_p], DVRK_PSM_BASE_FRAME,
+                                                    self.current_pc_snapshot.header.frame_id)[0]
+
+                tip_pose = tip_pose_from_wrist_pose(wrist_pose)
+
+                current_pose = wrist_pose if self.control_mode == 'wrist' else tip_pose
+                current_position = [current_pose.p.x(), current_pose.p.y(), current_pose.p.z()]
+
                 # First push
                 if iteration == 0:
 
@@ -666,19 +673,6 @@ class RetractionExperimentsNode(Node):
                 
                 # Subsequent pushes
                 else:
-                    # Get the current robot manipulation point
-                    wrist_pose = self.psm.setpoint_cp(wait_timeout=2.0)[0]
-                    wrist_p = wrist_pose.p
-                    # Sim: measured_cp is in DVRK_PSM_BASE_FRAME, so bring it back to the point cloud frame
-                    if self.robot_mode == 'sim':
-                        wrist_p = self.transform_points([wrist_p], DVRK_PSM_BASE_FRAME,
-                                                      self.current_pc_snapshot.header.frame_id)[0]
-
-                    tip_pose = tip_pose_from_wrist_pose(wrist_pose)
-
-                    current_pose = wrist_pose if self.control_mode == 'wrist' else tip_pose
-                    current_position = [current_pose.p.x(), current_pose.p.y(), current_pose.p.z()]
-
 
                     # Method selection
                     if self.push_method == 'PushVIBES_start_point_optimized':
@@ -696,14 +690,14 @@ class RetractionExperimentsNode(Node):
                 self.raw_action_marker = self.make_traj_marker(predicted_start_point, predicted_end_point, frame_id=frame_id,
                                                                ns="pushvibes_raw_action", shaft_rgb=(0.7, 0.0, 1.0))  # Bright purple
 
-                clipped_end_point = clip_action(predicted_start_point, predicted_end_point, keep_ratio=0.50)
+                clipped_end_point = clip_action(predicted_start_point, predicted_end_point, keep_ratio=self.clip_keep_ratio)
 
                 # Real robot only. Before the marker and the prompt below, so what's shown and confirmed is what gets executed
                 if self.robot_mode == 'real':
-                    predicted_start_point = self.keep_point_in_workspace(predicted_start_point, 'start')
-                    clipped_end_point = self.keep_point_in_workspace(clipped_end_point, 'end')
+                    predicted_start_point_is_in_workspace, adjusted_start_point = self.check_point_in_workspace(predicted_start_point, 'start')
+                    clipped_end_point_is_in_workspace, adjusted_end_point = self.check_point_in_workspace(clipped_end_point, 'end')
 
-                self.pushvibes_traj_marker = self.make_traj_marker(predicted_start_point, clipped_end_point, frame_id=frame_id)
+                self.pushvibes_traj_marker = self.make_traj_marker(adjusted_start_point, adjusted_end_point, frame_id=frame_id)
 
 
                 # press enter to continue, anything else to quit
@@ -712,8 +706,8 @@ class RetractionExperimentsNode(Node):
 
 
 
-                start_p = PyKDL.Vector(*(float(v) for v in predicted_start_point))
-                end_p = PyKDL.Vector(*(float(v) for v in clipped_end_point))
+                start_p = PyKDL.Vector(*(float(v) for v in adjusted_start_point))
+                end_p = PyKDL.Vector(*(float(v) for v in adjusted_end_point))
 
                 # Real: the robot takes commands in the point cloud (camera) frame, so the points are used as is.
                 # Sim: the robot takes commands in DVRK_PSM_BASE_FRAME, so transform the points there first.
@@ -723,7 +717,8 @@ class RetractionExperimentsNode(Node):
                                                            DVRK_PSM_BASE_FRAME)
 
 
-                # chamfer_pre_push = self.get_chamfer_distances()
+                chamfer_pre_push, chamfer_pre_push_current_to_goal, chamfer_pre_push_goal_to_current = get_chamfer_distances(current_pc_numpy, goal_pc_numpy)
+                chamfer_pre_push_squared, chamfer_pre_push_current_to_goal_squared, chamfer_pre_push_goal_to_current_squared = get_chamfer_distances(current_pc_numpy, goal_pc_numpy, squared=True)
 
                 target_start_pose = PyKDL.Frame(original_orientation, start_p) if self.control_mode == 'wrist' else wrist_pose_from_tip_pose(PyKDL.Frame(original_orientation, start_p)) # if control mode is tip, we treat start_p as a tip pose
                 target_end_pose = PyKDL.Frame(original_orientation, end_p) if self.control_mode == 'wrist' else wrist_pose_from_tip_pose(PyKDL.Frame(original_orientation, end_p)) # if control mode is tip, we treat end_p as a tip pose
@@ -736,53 +731,63 @@ class RetractionExperimentsNode(Node):
 
                 time.sleep(1.0) # Wait for tissue to settle
 
-                # chamfer_post_push = self.get_chamfer_distances()
+                final_pc_numpy  = self.get_current_pc_numpy()
+
+                chamfer_post_push, chamfer_post_push_current_to_goal, chamfer_post_push_goal_to_current = get_chamfer_distances(final_pc_numpy, goal_pc_numpy)
+                chamfer_post_push_squared, chamfer_post_push_current_to_goal_squared, chamfer_post_push_goal_to_current_squared = get_chamfer_distances(final_pc_numpy, goal_pc_numpy, squared=True)
 
 
                 # record data for iteration as .pickle file
 
 
-                # realsense_d405_data = {
-                #     "frame": ,
-                #     "transform_to_camera_color_optical": , # rename
-                #     "start_point_cloud": ,
-                #     # "start_point_cloud_downsampled": ,
-                #     # "start_point_cloud_downsampled_object_frame": ,
-                #     "final_point_cloud": ,
-                #     "goal_point_cloud": ,
-                #     # "goal_point_cloud_downsampled": ,
-                #     # "goal_point_cloud_downsampled_object_frame": ,
-                #     "context_point_cloud": ,
-                #     # "context_point_cloud_downsampled": ,
-                #     # "context_point_cloud_downsampled_object_frame": ,
-                #     "chamfer_pre_push": chamfer_pre_push,
-                #     "chamfer_post_push": chamfer_post_push
-
-                # }
+                realsense_d405_data = {
+                    "frame": None,
+                    "current_point_cloud": current_pc_numpy,
+                    "final_point_cloud": final_pc_numpy,
+                    "goal_point_cloud": goal_pc_numpy,
+                    "context_point_cloud": None,
+                    "chamfer_pre_push": chamfer_pre_push,
+                    "chamfer_pre_push_current_to_goal": chamfer_pre_push_current_to_goal,
+                    "chamfer_pre_push_goal_to_current": chamfer_pre_push_goal_to_current,
+                    "chamfer_post_push": chamfer_post_push,
+                    "chamfer_post_push_current_to_goal": chamfer_post_push_current_to_goal,
+                    "chamfer_post_push_goal_to_current": chamfer_post_push_goal_to_current,
+                    "chamfer_pre_push_squared": chamfer_pre_push_squared,
+                    "chamfer_pre_push_current_to_goal_squared": chamfer_pre_push_current_to_goal_squared,
+                    "chamfer_pre_push_goal_to_current_squared": chamfer_pre_push_goal_to_current_squared,
+                    "chamfer_post_push_squared": chamfer_post_push_squared,
+                    "chamfer_post_push_current_to_goal_squared": chamfer_post_push_current_to_goal_squared,
+                    "chamfer_post_push_goal_to_current_squared": chamfer_post_push_goal_to_current_squared,
+                }
 
                 # start_point_optimized_data = {
                 #     "optimization_history": ,
                     
                 # }
 
-                # experiment_iteration_data = {
-                #     "method": ,
-                #     "iteration": iteration,
-                #     "prediction_frame": ,
-                    
-                #     "start_point_pred": ,
-                #     "end_point_pred": ,
-                #     "end_point_clipped": ,
-                #     "start_point_outside_workspace": ,
-                #     "end_point_outside_workspace": ,
-                #     "start_point_adjusted": ,
-                #     "end_point_adjusted": ,
-                #     "table_plane_points": [],
-                #     "executed_push": ,
+                experiment_iteration_data = {
+                    "push_method": self.push_method,
+                    "control_mode": self.control_mode,
+                    "plane_offset_mm": self.plane_offset_mm, # TODO
+                    "workspace_height_mm": self.workspace_height_mm,
+                    "workspace_boundary": self.workspace_polygon,
+                    "iteration": iteration,
+                    "clip_keep_ratio": self.clip_keep_ratio,
+                    "pre_push_robot_wrist_pose": wrist_pose,
+                    "pre_push_robot_tip_pose": tip_pose,
+                    "start_point_pred": predicted_start_point,
+                    "start_point_adjusted": adjusted_start_point,
+                    "end_point_pred": predicted_end_point,
+                    "end_point_clipped": clipped_end_point,
+                    "end_point_adjusted": adjusted_end_point,
+                    "predicted_start_point_in_workspace": predicted_start_point_is_in_workspace,
+                    "clipped_end_point_in_workspace": clipped_end_point_is_in_workspace,
+                    "table_plane_points": self.plane_points,
+                    "executed_push": True,
 
 
 
-                # }
+                }
 
 
                 self.mark_marker_as_complete()

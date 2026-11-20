@@ -16,6 +16,7 @@
   <exec_depend>crtk_python_client</exec_depend>
   <exec_depend>crtk_msgs</exec_depend>
   <exec_depend>realsense2_camera_msgs</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

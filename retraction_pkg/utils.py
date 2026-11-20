@@ -7,6 +7,7 @@ import time
 import numpy as np
 import PyKDL
 from realsense2_camera_msgs.srv import DeviceInfo
+from scipy.spatial import cKDTree
 
 
 # RealSense serial numbers of the two camera placements
@@ -132,6 +133,25 @@ def clip_action(start_point, end_point, keep_ratio=1.0):
     start = np.asarray(start_point, dtype=float)
     push_vector = np.asarray(end_point, dtype=float) - start
     return start + keep_ratio * push_vector
+
+
+# ===========================
+# POINT CLOUD METRICS
+# ===========================
+def get_chamfer_distances(source, target, squared=False):
+    """Return (bidirectional, source_to_target, target_to_source) chamfer distances between two Nx3 point clouds.
+
+    source_to_target is the mean, over the source points, of the distance to the nearest target point, and
+    target_to_source the same the other way. bidirectional is their sum, not their mean. Distances are in the clouds'
+    units (m), or squared if squared is True, as in DiffDef's evaluation.
+    """
+    source_to_target_dists, _ = cKDTree(target).query(source)
+    target_to_source_dists, _ = cKDTree(source).query(target)
+    if squared:
+        source_to_target_dists, target_to_source_dists = source_to_target_dists**2, target_to_source_dists**2
+    source_to_target = float(np.mean(source_to_target_dists))
+    target_to_source = float(np.mean(target_to_source_dists))
+    return source_to_target + target_to_source, source_to_target, target_to_source
 
 
 # ===========================
